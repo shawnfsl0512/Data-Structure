@@ -22,6 +22,7 @@ backend/dist/
 *.db
 *.sqlite
 *.sqlite3
+!backend/travel_system.db
 
 # testing
 coverage/
