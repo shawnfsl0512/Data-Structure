@@ -17,6 +17,7 @@ interface ScenicArea {
   name: string;
   description: string;
   category: string;
+  city?: string | null;
   rating: number;
   tags: string;
   createdAt: Date;
@@ -40,6 +41,7 @@ interface Attraction {
   description: string;
   category: string;
   scenicAreaId: string;
+  city?: string | null;
   createdAt: Date;
   updatedAt: Date;
   type?: string;
@@ -129,6 +131,7 @@ export class QueryService {
       name: entity.name,
       description: entity.description || '',
       category: entity.category || '',
+      city: entity.city,
       rating: entity.rating || 0,
       tags: entity.tags || '',
       createdAt: entity.createdAt,
@@ -154,6 +157,7 @@ export class QueryService {
       description: entity.description || '',
       category: entity.category || '',
       scenicAreaId: entity.scenicAreaId,
+      city: entity.city,
       createdAt: entity.createdAt,
       updatedAt: entity.updatedAt,
       type: entity.type || '',
@@ -242,7 +246,7 @@ export class QueryService {
       return true;
     }
 
-    return [item.name, item.description, item.tags, item.category, item.cityLabel]
+    return [item.name, item.description, item.tags, item.category, item.cityLabel, item.city]
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
       .some((value) => value.toLowerCase().includes(normalizedKeyword));
   }
@@ -257,7 +261,7 @@ export class QueryService {
     const category = (item.category || '').toLowerCase();
     const tags = (item.tags || '').toLowerCase();
     const description = (item.description || '').toLowerCase();
-    const cityLabel = (item.cityLabel || '').toLowerCase();
+    const cityLabel = (item.cityLabel || item.city || '').toLowerCase();
 
     let score = 0;
 

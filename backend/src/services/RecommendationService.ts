@@ -172,6 +172,22 @@ export interface ScoredAttractionRecommendation extends AttractionRecommendation
   tagMatchScore: number;
 }
 
+export type ScenicRankingMode = 'popularity' | 'rating' | 'review' | 'personalized';
+
+export interface ScenicRankingMeta {
+  mode: ScenicRankingMode;
+  fallbackMode?: 'popularity';
+  reason?: 'guest_fallback' | 'interest_required' | 'no_interest_match';
+  city?: string | null;
+  appliedCityFilter: boolean;
+  matchedCount?: number;
+}
+
+export interface ScenicRankingResult {
+  items: ScenicArea[];
+  meta: ScenicRankingMeta;
+}
+
 // 简单的最小堆实现
 class MinHeap<T> {
   private heap: T[];
@@ -427,110 +443,247 @@ export class RecommendationService {
     return this.recommendByTags(mappedAttractions, this.buildRecommendationUserProfile(user), limit);
   }
 
+  private normalizeCityFilter(city?: string | null): string | null {
+    const normalized = String(city || '').trim();
+    return normalized ? normalized : null;
+  }
+
+  private normalizeScenicAreaTags(area: ScenicArea): string[] {
+    const rawTags = area.tags as unknown;
+    if (Array.isArray(rawTags)) {
+      return Array.from(new Set(rawTags.map((item) => String(item || '').trim()).filter(Boolean)));
+    }
+
+    const text = String(rawTags || '').trim();
+    if (!text) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return Array.from(new Set(parsed.map((item) => String(item || '').trim()).filter(Boolean)));
+      }
+    } catch {
+      // Ignore and fall back to delimiter parsing.
+    }
+
+    return Array.from(
+      new Set(
+        text
+          .replace(/^\[|\]$/g, '')
+          .split(/[,\uFF0C|]/)
+          .map((item) => item.trim().replace(/^["']|["']$/g, ''))
+          .filter(Boolean),
+      ),
+    );
+  }
+
+  private getScenicAreaMetric(area: ScenicArea, mode: Exclude<ScenicRankingMode, 'personalized'>): number {
+    if (mode === 'rating') {
+      return Number(area.averageRating || area.rating || 0);
+    }
+    if (mode === 'review') {
+      return Number(area.reviewCount || 0);
+    }
+    return Number(area.popularity || 0);
+  }
+
+  private filterScenicAreasByCity(areas: ScenicArea[], city?: string | null): ScenicArea[] {
+    const normalizedCity = this.normalizeCityFilter(city);
+    if (!normalizedCity) {
+      return areas;
+    }
+
+    return areas.filter((area) => String(area.city || '').trim() === normalizedCity);
+  }
+
+  private pickTopKScenicAreas(
+    areas: ScenicArea[],
+    k: number,
+    compare: (left: ScenicArea, right: ScenicArea) => number,
+  ): ScenicArea[] {
+    if (!Array.isArray(areas) || areas.length === 0 || k <= 0) {
+      return [];
+    }
+
+    const safeK = Math.max(1, Math.floor(k));
+    const minHeap = new MinHeap<ScenicArea>(safeK, compare);
+    areas.forEach((area) => minHeap.insert(area));
+    return minHeap.getTopK();
+  }
+
+  private buildScenicRankingResult(
+    areas: ScenicArea[],
+    mode: ScenicRankingMode,
+    limit: number,
+    city?: string | null,
+  ): ScenicRankingResult {
+    const normalizedCity = this.normalizeCityFilter(city);
+    const filteredAreas = this.filterScenicAreasByCity(areas, normalizedCity);
+    const metricMode = mode === 'personalized' ? 'popularity' : mode;
+    const topAreas = this.pickTopKScenicAreas(filteredAreas, limit, (left, right) => {
+      const metricDiff = this.getScenicAreaMetric(left, metricMode) - this.getScenicAreaMetric(right, metricMode);
+      if (metricDiff !== 0) {
+        return metricDiff;
+      }
+      return Number(left.popularity || 0) - Number(right.popularity || 0);
+    });
+
+    return {
+      items: this.presentScenicAreas(topAreas),
+      meta: {
+        mode,
+        city: normalizedCity,
+        appliedCityFilter: Boolean(normalizedCity),
+      },
+    };
+  }
+
+  private buildPopularityFallbackResult(
+    areas: ScenicArea[],
+    limit: number,
+    city: string | null,
+    reason: ScenicRankingMeta['reason'],
+  ): ScenicRankingResult {
+    const base = this.buildScenicRankingResult(areas, 'popularity', limit, city);
+    return {
+      items: base.items,
+      meta: {
+        ...base.meta,
+        mode: 'personalized',
+        fallbackMode: 'popularity',
+        reason,
+      },
+    };
+  }
+
+  private getUserInterestTags(user: User | null | undefined): string[] {
+    return Array.from(new Set(this.normalizeUserInterests(user?.interests || [])));
+  }
+
+  private matchScenicAreasByUserInterests(areas: ScenicArea[], interests: string[]): ScenicArea[] {
+    if (!interests.length) {
+      return [];
+    }
+
+    const interestSet = new Set(interests.map((item) => String(item || '').trim()).filter(Boolean));
+    return areas.filter((area) => this.normalizeScenicAreaTags(area).some((tag) => interestSet.has(tag)));
+  }
+
   // 热度榜
-  async getPopularityRanking(limit: number = 10): Promise<ScenicArea[]> {
-    const cacheKey = `popularity_ranking_${limit}`;
+  async getPopularityRanking(limit: number = 10, city?: string | null): Promise<ScenicRankingResult> {
+    const cacheKey = 'popularity_ranking_all';
     
     // 尝试从缓存获取
     const cachedResult = cache.get(cacheKey);
     if (cachedResult) {
-      return this.presentScenicAreas(cachedResult as ScenicArea[]);
+      return this.buildScenicRankingResult(cachedResult as ScenicArea[], 'popularity', limit, city);
     }
     
     const scenicAreaRepository = getScenicAreaRepository();
     // 按照访问量排序
     const topAreas = await scenicAreaRepository.find({
       order: { popularity: 'DESC' },
-      take: limit
     });
     
     // 缓存结果，设置10分钟过期
-    const result = this.presentScenicAreas(topAreas);
-    cache.set(cacheKey, result, 10 * 60 * 1000);
+    cache.set(cacheKey, topAreas, 10 * 60 * 1000);
     
-    return result;
+    return this.buildScenicRankingResult(topAreas, 'popularity', limit, city);
   }
 
   // 评分榜
-  async getRatingRanking(limit: number = 10): Promise<ScenicArea[]> {
-    const cacheKey = `rating_ranking_${limit}`;
+  async getRatingRanking(limit: number = 10, city?: string | null): Promise<ScenicRankingResult> {
+    const cacheKey = 'rating_ranking_all';
     
     // 尝试从缓存获取
     const cachedResult = cache.get(cacheKey);
     if (cachedResult) {
-      return this.presentScenicAreas(cachedResult as ScenicArea[]);
+      return this.buildScenicRankingResult(cachedResult as ScenicArea[], 'rating', limit, city);
     }
     
     const scenicAreaRepository = getScenicAreaRepository();
     // 按照评分排序
     const topAreas = await scenicAreaRepository.find({
       order: { averageRating: 'DESC' },
-      take: limit
     });
     
     // 缓存结果，设置10分钟过期
-    const result = this.presentScenicAreas(topAreas);
-    cache.set(cacheKey, result, 10 * 60 * 1000);
+    cache.set(cacheKey, topAreas, 10 * 60 * 1000);
     
-    return result;
+    return this.buildScenicRankingResult(topAreas, 'rating', limit, city);
   }
 
   // 评价榜
-  async getReviewRanking(limit: number = 10): Promise<ScenicArea[]> {
-    const cacheKey = `review_ranking_${limit}`;
+  async getReviewRanking(limit: number = 10, city?: string | null): Promise<ScenicRankingResult> {
+    const cacheKey = 'review_ranking_all';
     
     // 尝试从缓存获取
     const cachedResult = cache.get(cacheKey);
     if (cachedResult) {
-      return this.presentScenicAreas(cachedResult as ScenicArea[]);
+      return this.buildScenicRankingResult(cachedResult as ScenicArea[], 'review', limit, city);
     }
     
     const scenicAreaRepository = getScenicAreaRepository();
     // 按照评价数量排序
     const topAreas = await scenicAreaRepository.find({
       order: { reviewCount: 'DESC' },
-      take: limit
     });
     
     // 缓存结果，设置10分钟过期
-    const result = this.presentScenicAreas(topAreas);
-    cache.set(cacheKey, result, 10 * 60 * 1000);
+    cache.set(cacheKey, topAreas, 10 * 60 * 1000);
     
-    return result;
+    return this.buildScenicRankingResult(topAreas, 'review', limit, city);
   }
-
-  // 个人兴趣榜
-  async getPersonalizedRanking(userId: string, limit: number = 10): Promise<ScenicArea[]> {
+  // ?????
+  async getPersonalizedRanking(userId: string | undefined, limit: number = 10, city?: string | null): Promise<ScenicRankingResult> {
     const userRepository = getUserRepository();
     const scenicAreaRepository = getScenicAreaRepository();
-    
-    // 获取用户信息
-    const user = await userRepository.findOne({ where: { id: userId } });
+
+    const normalizedCity = this.normalizeCityFilter(city);
+    const [user, allScenicAreas] = await Promise.all([
+      userId ? userRepository.findOne({ where: { id: userId } }) : Promise.resolve(null),
+      scenicAreaRepository.find(),
+    ]);
+
     if (!user) {
-      throw new Error('User not found');
+      return this.buildPopularityFallbackResult(allScenicAreas, limit, normalizedCity, 'guest_fallback');
     }
 
-    // 获取所有景区
-    const allScenicAreas = await scenicAreaRepository.find();
+    const candidateAreas = this.filterScenicAreasByCity(allScenicAreas, normalizedCity).filter(
+      (area) => !(user.favorites && user.favorites.includes(area.id)),
+    );
+    const interests = this.getUserInterestTags(user);
 
-    // 使用最小堆进行Top-K推荐
-    const minHeap = new MinHeap<{ score: number; area: ScenicArea }>(limit, (a, b) => a.score - b.score);
-
-    // 构建推荐列表
-    for (const area of allScenicAreas) {
-      // 跳过用户已经收藏的景区
-      if (user.favorites && user.favorites.includes(area.id)) {
-        continue;
-      }
-
-      const score = this.calculatePersonalizedScore(area, user);
-      minHeap.insert({ score, area });
+    if (!interests.length) {
+      return this.buildPopularityFallbackResult(candidateAreas, limit, normalizedCity, 'interest_required');
     }
 
-    // 从堆中提取结果
-    const recommendations = minHeap.getTopK().map(item => item.area);
-    
-    return this.presentScenicAreas(recommendations);
+    const matchedAreas = this.matchScenicAreasByUserInterests(candidateAreas, interests);
+    if (!matchedAreas.length) {
+      return {
+        items: [],
+        meta: {
+          mode: 'personalized',
+          city: normalizedCity,
+          appliedCityFilter: Boolean(normalizedCity),
+          reason: 'no_interest_match',
+          matchedCount: 0,
+        },
+      };
+    }
+
+    const base = this.buildScenicRankingResult(matchedAreas, 'popularity', limit, normalizedCity);
+    return {
+      items: base.items,
+      meta: {
+        mode: 'personalized',
+        city: normalizedCity,
+        appliedCityFilter: Boolean(normalizedCity),
+        matchedCount: matchedAreas.length,
+      },
+    };
   }
 
   // 基于用户行为的个性化推荐

@@ -1,11 +1,12 @@
 import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
-import recommendationService, { ScenicArea } from '../../services/recommendationService';
+import recommendationService, { ScenicArea, ScenicRankingMeta } from '../../services/recommendationService';
 import { resolveErrorMessage } from '../../utils/errorMessage';
 
 export type RankingType = 'popularity' | 'rating' | 'review' | 'personalized';
 
 export interface RecommendationState {
   topAttractions: ScenicArea[];
+  rankingMeta: ScenicRankingMeta | null;
   personalizedRecommendations: ScenicArea[];
   incrementalRecommendations: ScenicArea[];
   isLoading: boolean;
@@ -14,6 +15,7 @@ export interface RecommendationState {
 
 const initialState: RecommendationState = {
   topAttractions: [],
+  rankingMeta: null,
   personalizedRecommendations: [],
   incrementalRecommendations: [],
   isLoading: false,
@@ -38,31 +40,31 @@ export const getTopAttractions = createAsyncThunk(
 
 export const getRankingAttractions = createAsyncThunk(
   'recommendation/getRankingAttractions',
-  async ({ type, limit = 10 }: { type: RankingType; limit?: number }, { rejectWithValue }) => {
-    const fallbackMessage = '获取榜单景区失败';
+  async ({ type, limit = 10, city }: { type: RankingType; limit?: number; city?: string }, { rejectWithValue }) => {
+    const fallbackMessage = '????????';
     try {
       const response =
         type === 'rating'
-          ? await recommendationService.getRatingRanking(limit)
+          ? await recommendationService.getRatingRanking(limit, city)
           : type === 'review'
-            ? await recommendationService.getReviewRanking(limit)
+            ? await recommendationService.getReviewRanking(limit, city)
             : type === 'personalized'
-              ? await recommendationService.getPersonalizedRanking(limit)
-              : await recommendationService.getPopularityRanking(limit);
+              ? await recommendationService.getPersonalizedRanking(limit, city)
+              : await recommendationService.getPopularityRanking(limit, city);
 
       if (response.success) {
-        return response.data;
+        return { data: response.data, meta: response.meta || null };
       }
       return rejectWithValue(fallbackMessage);
     } catch (error) {
       if (type === 'personalized') {
         try {
-          const fallbackResponse = await recommendationService.getPopularityRanking(limit);
+          const fallbackResponse = await recommendationService.getPopularityRanking(limit, city);
           if (fallbackResponse.success) {
-            return fallbackResponse.data;
+            return { data: fallbackResponse.data, meta: fallbackResponse.meta || null };
           }
         } catch {
-          return rejectWithValue('获取个性化榜单失败，且热门榜单兜底也未成功');
+          return rejectWithValue('?????????????????????');
         }
       }
 
@@ -74,7 +76,7 @@ export const getRankingAttractions = createAsyncThunk(
 export const getPersonalizedRecommendations = createAsyncThunk(
   'recommendation/getPersonalizedRecommendations',
   async (limit: number = 10, { rejectWithValue }) => {
-    const fallbackMessage = '获取个性化推荐失败';
+    const fallbackMessage = '????????';
     try {
       const response = await recommendationService.getPersonalizedRecommendations(limit);
       if (response.success) {
@@ -90,7 +92,7 @@ export const getPersonalizedRecommendations = createAsyncThunk(
 export const getIncrementalRecommendations = createAsyncThunk(
   'recommendation/getIncrementalRecommendations',
   async (limit: number = 5, { rejectWithValue }) => {
-    const fallbackMessage = '获取渐进式推荐失败';
+    const fallbackMessage = '????????';
     try {
       const response = await recommendationService.getIncrementalRecommendations(limit);
       if (response.success) {
@@ -114,7 +116,7 @@ export const learnUserBehavior = createAsyncThunk(
     }: { itemId: string; behaviorType: string; category?: string; rating?: number },
     { rejectWithValue },
   ) => {
-    const fallbackMessage = '记录用户偏好行为失败';
+    const fallbackMessage = '????????';
     try {
       const response = await recommendationService.learnUserBehavior(
         itemId,
@@ -160,11 +162,13 @@ const recommendationSlice = createSlice({
       })
       .addCase(getRankingAttractions.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.topAttractions = action.payload;
+        state.topAttractions = action.payload.data;
+        state.rankingMeta = action.payload.meta;
       })
       .addCase(getRankingAttractions.rejected, (state, action) => {
         state.isLoading = false;
         state.error = action.payload as string;
+        state.rankingMeta = null;
       })
       .addCase(getPersonalizedRecommendations.pending, (state) => {
         state.isLoading = true;

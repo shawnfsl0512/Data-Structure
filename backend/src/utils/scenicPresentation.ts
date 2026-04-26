@@ -4,6 +4,7 @@ import { REAL_SCENIC_CATALOG } from '../data/realScenicCatalog';
 type ScenicPresentable = {
   name: string;
   category?: string | null;
+  city?: string | null;
   description?: string | null;
   coverImageUrl?: string | null;
   coverPageUrl?: string | null;
@@ -134,7 +135,16 @@ const hasValidCover = (scenic: ScenicPresentable) => {
   return Boolean(scenic.coverImageUrl) && !invalidCoverPattern.test(sourceText);
 };
 
-const resolveCityLabel = (name: string, description?: string | null, tags?: string | string[] | null) => {
+const resolveCityLabel = (
+  name: string,
+  explicitCityLabel?: string | null,
+  description?: string | null,
+  tags?: string | string[] | null,
+) => {
+  if (explicitCityLabel) {
+    return explicitCityLabel;
+  }
+
   const exactMatchCity = exactCityByName.get(name);
   if (exactMatchCity) {
     return exactMatchCity;
@@ -154,7 +164,7 @@ const resolveCityLabel = (name: string, description?: string | null, tags?: stri
 export const resolveScenicPresentation = (scenic: ScenicPresentable): ScenicPresentation => {
   const name = scenic.name || '精选目的地';
   const category = scenic.category || '景区';
-  const cityLabel = resolveCityLabel(name, scenic.description, scenic.tags);
+  const cityLabel = resolveCityLabel(name, scenic.city, scenic.description, scenic.tags);
 
   if (hasValidCover(scenic)) {
     return {

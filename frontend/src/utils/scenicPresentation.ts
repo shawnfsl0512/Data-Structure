@@ -1,6 +1,7 @@
 type ScenicCoverLike = {
   name: string;
   category?: string | null;
+  city?: string | null;
   coverImageUrl?: string | null;
   coverPageUrl?: string | null;
   cityLabel?: string | null;

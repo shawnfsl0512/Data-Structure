@@ -18,6 +18,15 @@ export interface ScenicArea {
   tags?: string[];
 }
 
+export interface ScenicRankingMeta {
+  mode: 'popularity' | 'rating' | 'review' | 'personalized';
+  fallbackMode?: 'popularity';
+  reason?: 'guest_fallback' | 'interest_required' | 'no_interest_match';
+  city?: string | null;
+  appliedCityFilter: boolean;
+  matchedCount?: number;
+}
+
 export interface RecommendationExplanation {
   factors: Array<{ name: string; weight: number; explanation: string }>;
   totalScore: number;
@@ -103,10 +112,10 @@ export interface CityTravelItinerary {
 }
 
 export interface RecommendationService {
-  getPopularityRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
-  getRatingRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
-  getReviewRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
-  getPersonalizedRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  getPopularityRanking: (limit?: number, city?: string) => Promise<{ success: boolean; data: ScenicArea[]; meta?: ScenicRankingMeta }>;
+  getRatingRanking: (limit?: number, city?: string) => Promise<{ success: boolean; data: ScenicArea[]; meta?: ScenicRankingMeta }>;
+  getReviewRanking: (limit?: number, city?: string) => Promise<{ success: boolean; data: ScenicArea[]; meta?: ScenicRankingMeta }>;
+  getPersonalizedRanking: (limit?: number, city?: string) => Promise<{ success: boolean; data: ScenicArea[]; meta?: ScenicRankingMeta }>;
   getPersonalizedRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
   getIncrementalRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
   getExplorationRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
@@ -122,20 +131,28 @@ export interface RecommendationService {
 }
 
 const recommendationService: RecommendationService = {
-  getPopularityRanking: async (limit = 10) => {
-    return api.get(`/recommendations/ranking/popularity?limit=${limit}`);
+  getPopularityRanking: async (limit = 10, city) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (city) query.set('city', city);
+    return api.get(`/recommendations/ranking/popularity?${query.toString()}`);
   },
   
-  getRatingRanking: async (limit = 10) => {
-    return api.get(`/recommendations/ranking/rating?limit=${limit}`);
+  getRatingRanking: async (limit = 10, city) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (city) query.set('city', city);
+    return api.get(`/recommendations/ranking/rating?${query.toString()}`);
   },
   
-  getReviewRanking: async (limit = 10) => {
-    return api.get(`/recommendations/ranking/review?limit=${limit}`);
+  getReviewRanking: async (limit = 10, city) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (city) query.set('city', city);
+    return api.get(`/recommendations/ranking/review?${query.toString()}`);
   },
   
-  getPersonalizedRanking: async (limit = 10) => {
-    return api.get(`/recommendations/ranking/personalized?limit=${limit}`);
+  getPersonalizedRanking: async (limit = 10, city) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (city) query.set('city', city);
+    return api.get(`/recommendations/ranking/personalized?${query.toString()}`);
   },
   
   getPersonalizedRecommendations: async (limit = 10) => {

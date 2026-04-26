@@ -1,6 +1,6 @@
 import express from 'express';
 import { RecommendationService } from '../services/RecommendationService';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, optionalAuthMiddleware } from '../middleware/auth';
 
 const router = express.Router();
 const recommendationService = new RecommendationService();
@@ -73,10 +73,12 @@ router.post('/city-itinerary', authMiddleware, async (req, res) => {
 router.get('/ranking/popularity', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit as string, 10) || 10;
-    const topAreas = await recommendationService.getPopularityRanking(limit);
+    const city = typeof req.query.city === 'string' ? req.query.city.trim() : undefined;
+    const result = await recommendationService.getPopularityRanking(limit, city);
     res.status(200).json({
       success: true,
-      data: topAreas,
+      data: result.items,
+      meta: result.meta,
     });
   } catch (error: any) {
     res.status(500).json({
@@ -92,10 +94,12 @@ router.get('/ranking/popularity', async (req, res) => {
 router.get('/ranking/rating', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit as string, 10) || 10;
-    const topAreas = await recommendationService.getRatingRanking(limit);
+    const city = typeof req.query.city === 'string' ? req.query.city.trim() : undefined;
+    const result = await recommendationService.getRatingRanking(limit, city);
     res.status(200).json({
       success: true,
-      data: topAreas,
+      data: result.items,
+      meta: result.meta,
     });
   } catch (error: any) {
     res.status(500).json({
@@ -111,10 +115,12 @@ router.get('/ranking/rating', async (req, res) => {
 router.get('/ranking/review', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit as string, 10) || 10;
-    const topAreas = await recommendationService.getReviewRanking(limit);
+    const city = typeof req.query.city === 'string' ? req.query.city.trim() : undefined;
+    const result = await recommendationService.getReviewRanking(limit, city);
     res.status(200).json({
       success: true,
-      data: topAreas,
+      data: result.items,
+      meta: result.meta,
     });
   } catch (error: any) {
     res.status(500).json({
@@ -127,14 +133,16 @@ router.get('/ranking/review', async (req, res) => {
   }
 });
 
-router.get('/ranking/personalized', authMiddleware, async (req, res) => {
+router.get('/ranking/personalized', optionalAuthMiddleware, async (req, res) => {
   try {
-    const userId = (req as any).user.userId;
+    const userId = (req as any).user?.userId;
     const limit = parseInt(req.query.limit as string, 10) || 10;
-    const topAreas = await recommendationService.getPersonalizedRanking(userId, limit);
+    const city = typeof req.query.city === 'string' ? req.query.city.trim() : undefined;
+    const result = await recommendationService.getPersonalizedRanking(userId, limit, city);
     res.status(200).json({
       success: true,
-      data: topAreas,
+      data: result.items,
+      meta: result.meta,
     });
   } catch (error: any) {
     res.status(500).json({

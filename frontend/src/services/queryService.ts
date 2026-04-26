@@ -4,6 +4,7 @@ export interface ScenicArea {
   id: string;
   name: string;
   category: string;
+  city?: string | null;
   description?: string;
   coverImageUrl?: string;
   cityLabel?: string;
@@ -35,6 +36,7 @@ export interface Attraction {
   id: string;
   name: string;
   category: string;
+  city?: string | null;
   description?: string;
   latitude?: number;
   longitude?: number;

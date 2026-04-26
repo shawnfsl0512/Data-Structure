@@ -18,6 +18,9 @@ export class ScenicArea {
   @Column({ type: 'varchar', length: 100, nullable: false })
   category: string = '';
 
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  city: string | null = null;
+
   @Column({ type: 'text', nullable: true })
   description: string = '';
 

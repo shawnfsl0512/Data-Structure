@@ -26,6 +26,9 @@ export class Attraction {
   @Column({ type: 'varchar', length: 100, nullable: true })
   category: string = '';
 
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  city: string | null = null;
+
   @Column({ type: 'text', nullable: true })
   description: string = '';
 

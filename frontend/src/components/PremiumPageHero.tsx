@@ -14,6 +14,7 @@ type PremiumPageHeroProps = {
   description: string;
   tags?: string[];
   metrics?: HeroMetric[];
+  sideContent?: React.ReactNode;
   actions?: React.ReactNode;
   accent?: 'blue' | 'amber' | 'teal';
   eyebrow?: string;
@@ -33,6 +34,7 @@ const PremiumPageHero: React.FC<PremiumPageHeroProps> = ({
   description,
   tags = [],
   metrics = [],
+  sideContent,
   actions,
   accent = 'blue',
   eyebrow,
@@ -61,7 +63,7 @@ const PremiumPageHero: React.FC<PremiumPageHeroProps> = ({
         }}
       />
       <Row gutter={[20, 20]} align="middle">
-        <Col xs={24} lg={coverImageUrl ? 15 : metrics.length > 0 ? 14 : 24}>
+        <Col xs={24} lg={coverImageUrl ? 15 : sideContent || metrics.length > 0 ? 14 : 24}>
           <Space direction="vertical" size={10} style={{ width: '100%' }}>
             <div>
               {eyebrow ? (
@@ -141,6 +143,10 @@ const PremiumPageHero: React.FC<PremiumPageHeroProps> = ({
                 </div>
               ) : null}
             </div>
+          </Col>
+        ) : sideContent ? (
+          <Col xs={24} lg={10}>
+            {sideContent}
           </Col>
         ) : metrics.length > 0 ? (
           <Col xs={24} lg={10}>

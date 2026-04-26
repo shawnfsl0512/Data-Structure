@@ -81,8 +81,8 @@ async function run() {
 
   try {
     const ranking = await recommendationService.getPopularityRanking(5);
-    assert(Array.isArray(ranking), '推荐结果不是数组');
-    record('推荐服务-热度榜', true, `返回 ${ranking.length} 条`);
+    assert(Array.isArray(ranking.items), '????????');
+    record('????-???', true, `?? ${ranking.items.length} ?`);
   } catch (error: any) {
     record('推荐服务-热度榜', false, error.message);
   }

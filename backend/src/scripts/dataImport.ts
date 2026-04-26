@@ -25,6 +25,7 @@ import {
   type SharedRealMapTemplateData,
   type SharedTemplatePoint,
 } from '../utils/sharedRealMapTemplate';
+import { buildScenicClassificationTags } from '../utils/scenicTagging';
 import { normalizeStringArray } from '../utils/stringArrayField';
 
 dotenv.config();
@@ -1120,6 +1121,7 @@ async function importData() {
         id: scenicId,
         name: scenicName,
         category: item.category,
+        city: item.city,
         description: buildScenicDescription(scenicName, item.city, isCampus),
         latitude: center.latitude,
         longitude: center.longitude,
@@ -1128,7 +1130,12 @@ async function importData() {
         popularity: rng.int(3000, 180000),
         averageRating: Number(rng.float(4.0, 4.9).toFixed(2)),
         reviewCount: rng.int(200, 8000),
-        tags: isCampus ? `校园,${item.city},教学,生活服务` : `景区,${item.city},观光,文旅`,
+        tags: buildScenicClassificationTags({
+          name: scenicName,
+          category: item.category,
+          description: buildScenicDescription(scenicName, item.city, isCampus),
+          city: item.city,
+        }).join(','),
         rating: Number(rng.float(4.0, 4.9).toFixed(2)),
         visitorCount: rng.int(12000, 600000),
         coverImageUrl: preservedCover?.coverImageUrl || null,
@@ -1153,6 +1160,7 @@ async function importData() {
           name: `${scenicName}-${buildingCategory}${String(attractionIndex + 1).padStart(2, '0')}`,
           type: rng.pick(ATTRACTION_TYPES),
           category: buildingCategory,
+          city: item.city,
           description: buildAttractionDescription(buildingCategory, scenicName, isCampus),
           latitude: coord.latitude,
           longitude: coord.longitude,
@@ -1161,7 +1169,7 @@ async function importData() {
           reviewCount: rng.int(20, 4000),
           estimatedVisitDuration: rng.int(20, 120),
           congestionFactor: Number(rng.float(0.72, 1.24).toFixed(2)),
-          tags: [item.city, item.category, buildingCategory],
+          tags: [item.category, buildingCategory],
           indoorStructure:
             attractionIndex % (isCampus ? 4 : 6) === 0
               ? buildIndoorStructure(`${scenicName}-${buildingCategory}${attractionIndex + 1}`)
@@ -1438,7 +1446,12 @@ async function importData() {
         city: item.city,
         category: item.category,
         center,
-        tags: isCampus ? ['校园', item.city, '教学', '生活服务'] : ['景区', item.city, '观光', '文旅'],
+        tags: buildScenicClassificationTags({
+          name: scenicName,
+          category: item.category,
+          description: buildScenicDescription(scenicName, item.city, isCampus),
+          city: item.city,
+        }),
         attractions: attractions.map((attraction) => ({
           id: attraction.id,
           name: attraction.name,
