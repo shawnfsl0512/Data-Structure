@@ -8,6 +8,7 @@ import { RoadGraphEdge as RoadGraphEdgeEntity } from '../entities/RoadGraphEdge'
 import { RoadGraphNode as RoadGraphNodeEntity } from '../entities/RoadGraphNode';
 import { ScenicArea as ScenicAreaEntity } from '../entities/ScenicArea';
 import { Trie } from '../algorithms/Trie';
+import { mapTemplateRuntimeService } from './MapTemplateRuntimeService';
 import { resolveScenicPresentation } from '../utils/scenicPresentation';
 import { haversineDistanceKm } from '../utils/geoUtils';
 import { normalizeStringArray } from '../utils/stringArrayField';
@@ -357,8 +358,15 @@ export class QueryService {
 
       const scenicAreaEntity = await scenicAreaRepository.findOne({ where: { id } });
       if (scenicAreaEntity) {
-        const attractions = await attractionRepository.find({ where: { scenicAreaId: id } });
-        const facilities = await facilityRepository.find({ where: { scenicAreaId: id } });
+        let attractions = await attractionRepository.find({ where: { scenicAreaId: id } });
+        let facilities = await facilityRepository.find({ where: { scenicAreaId: id } });
+        if (!attractions.length && !facilities.length) {
+          const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicArea(scenicAreaEntity);
+          if (runtimeMap) {
+            attractions = runtimeMap.attractions;
+            facilities = runtimeMap.facilities;
+          }
+        }
         return {
           scenicArea: this.mapScenicArea(scenicAreaEntity),
           attractions: attractions.map((item) => this.mapAttraction(item)),
@@ -484,7 +492,7 @@ export class QueryService {
       : undefined;
 
     const queryTake = Math.max(limit * 6, 30);
-    const entities = scenicAreaId
+    let entities = scenicAreaId
       ? await facilityRepository.find({
           where: whereByType
             ? whereByType.map((item) => ({ scenicAreaId, ...item }))
@@ -495,6 +503,38 @@ export class QueryService {
           where: whereByType,
           take: queryTake,
         });
+
+    if (!entities.length) {
+      if (scenicAreaId) {
+        const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+        if (runtimeMap) {
+          entities = runtimeMap.facilities;
+        }
+      } else {
+        const scenicAreaRepository = AppDataSource.getRepository(ScenicAreaEntity);
+        const scenicAreas = await scenicAreaRepository.find({
+          select: ['id', 'name', 'category', 'city', 'latitude', 'longitude', 'createdAt', 'updatedAt'],
+        });
+        const runtimeFacilities: FacilityEntity[] = [];
+        for (const scenicArea of scenicAreas) {
+          const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicArea(scenicArea);
+          if (runtimeMap) {
+            runtimeFacilities.push(...runtimeMap.facilities);
+          }
+        }
+        entities = runtimeFacilities;
+      }
+    }
+
+    if (whereByType?.length) {
+      const normalizedKeywords = expandedTypes.map((item) => item.toLowerCase());
+      entities = entities.filter((item) => {
+        const haystacks = [item.category, item.name]
+          .map((value) => String(value || '').toLowerCase())
+          .filter(Boolean);
+        return normalizedKeywords.some((keyword) => haystacks.some((text) => text.includes(keyword)));
+      });
+    }
 
     const facilities = entities.map((item) => this.mapFacility(item));
     if (!userLocation || !facilities.length) {
@@ -570,10 +610,29 @@ export class QueryService {
   async searchFood(query: string, limit: number = 10): Promise<Attraction[]> {
     if (AppDataSource && AppDataSource.isInitialized) {
       const foodRepository = AppDataSource.getRepository(FoodEntity);
-      const entities = await foodRepository.find({
+      let entities = await foodRepository.find({
         where: [{ name: Like(`%${query}%`) }, { cuisine: Like(`%${query}%`) }, { description: Like(`%${query}%`) }],
         take: limit,
       });
+      if (!entities.length) {
+        const scenicAreaRepository = AppDataSource.getRepository(ScenicAreaEntity);
+        const scenicAreas = await scenicAreaRepository.find({
+          select: ['id', 'name', 'category', 'city', 'latitude', 'longitude', 'createdAt', 'updatedAt'],
+        });
+        const runtimeFoods: FoodEntity[] = [];
+        for (const scenicArea of scenicAreas) {
+          const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicArea(scenicArea);
+          if (runtimeMap) {
+            runtimeFoods.push(...runtimeMap.foods);
+          }
+        }
+        entities = runtimeFoods.filter(
+          (item) =>
+            item.name.includes(query) ||
+            String(item.cuisine || '').includes(query) ||
+            String(item.description || '').includes(query),
+        );
+      }
       return entities.map((item) => ({
         id: item.id,
         name: item.name,
@@ -736,7 +795,29 @@ export class QueryService {
     ]);
 
     if (!nodes.length || !edges.length) {
-      return null;
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return null;
+      }
+      const graph = {
+        nodes: runtimeMap.roadNodes.map((item) => ({
+          id: item.id,
+          scenicAreaId: item.scenicAreaId,
+          latitude: Number(item.latitude ?? 0),
+          longitude: Number(item.longitude ?? 0),
+        })),
+        edges: runtimeMap.roadEdges.map((item) => ({
+          fromNodeId: item.fromNodeId,
+          toNodeId: item.toNodeId,
+          scenicAreaId: item.scenicAreaId,
+          distance: Number(item.distance ?? 0),
+        })),
+      };
+      this.roadGraphCache.set(scenicAreaId, {
+        ...graph,
+        expiresAt: now + this.roadGraphCacheTTL,
+      });
+      return graph;
     }
 
     const graph = {

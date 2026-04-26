@@ -4,6 +4,7 @@ import { Attraction } from '../entities/Attraction';
 import { PhotoCheckin } from '../entities/PhotoCheckin';
 import { PhotoSpot } from '../entities/PhotoSpot';
 import { ScenicArea } from '../entities/ScenicArea';
+import { mapTemplateRuntimeService } from './MapTemplateRuntimeService';
 
 function getPhotoSpotRepository() {
   if (!AppDataSource) {
@@ -58,11 +59,16 @@ export class PhotoSpotService {
     });
 
     if (!spots.length) {
-      await this.generateDefaultPhotoSpots(scenicAreaId);
-      spots = await photoSpotRepository.find({
-        where: { scenicAreaId },
-        order: { popularity: 'DESC', createdAt: 'ASC' },
-      });
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (runtimeMap?.photoSpots.length) {
+        spots = runtimeMap.photoSpots;
+      } else {
+        await this.generateDefaultPhotoSpots(scenicAreaId);
+        spots = await photoSpotRepository.find({
+          where: { scenicAreaId },
+          order: { popularity: 'DESC', createdAt: 'ASC' },
+        });
+      }
     }
 
     return spots.map((spot) => ({
@@ -86,12 +92,13 @@ export class PhotoSpotService {
   async calculateBestPhotoTime(photoSpotId: string): Promise<string> {
     const photoSpotRepository = getPhotoSpotRepository();
     const spot = await photoSpotRepository.findOne({ where: { id: photoSpotId } });
-    if (!spot) {
+    const runtimeSpot = spot ?? (await this.resolveRuntimePhotoSpot(photoSpotId));
+    if (!runtimeSpot) {
       throw new Error('Photo spot not found');
     }
 
-    const bestTime = this.computeBestTime(spot.crowdLevel, spot.lightingCondition, new Date());
-    if (spot.bestTime !== bestTime) {
+    const bestTime = this.computeBestTime(runtimeSpot.crowdLevel, runtimeSpot.lightingCondition, new Date());
+    if (spot && spot.bestTime !== bestTime) {
       spot.bestTime = bestTime;
       await photoSpotRepository.save(spot);
     }
@@ -114,7 +121,8 @@ export class PhotoSpotService {
     const photoCheckinRepository = getPhotoCheckinRepository();
 
     const spot = await photoSpotRepository.findOne({ where: { id: photoSpotId } });
-    if (!spot) {
+    const runtimeSpot = spot ?? (await this.resolveRuntimePhotoSpot(photoSpotId));
+    if (!runtimeSpot) {
       throw new Error('Photo spot not found');
     }
 
@@ -127,8 +135,10 @@ export class PhotoSpotService {
     });
     const savedCheckin = await photoCheckinRepository.save(checkin);
 
-    spot.popularity = (spot.popularity || 0) + 1;
-    await photoSpotRepository.save(spot);
+    if (spot) {
+      spot.popularity = (spot.popularity || 0) + 1;
+      await photoSpotRepository.save(spot);
+    }
 
     return {
       id: savedCheckin.id,
@@ -192,7 +202,26 @@ export class PhotoSpotService {
 
     const spots = await photoSpotRepository.find({ where: { scenicAreaId }, select: ['id'] });
     if (!spots.length) {
-      return [];
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap?.photoSpots.length) {
+        return [];
+      }
+      const ids = runtimeMap.photoSpots.map((item) => item.id);
+      const checkins = await photoCheckinRepository.find({
+        where: { photoSpotId: In(ids) },
+        order: { likes: 'DESC', createdAt: 'DESC' },
+        take: limit,
+      });
+
+      return checkins.map((checkin) => ({
+        id: checkin.id,
+        userId: checkin.userId,
+        photoSpotId: checkin.photoSpotId,
+        photoUrl: checkin.photoUrl,
+        caption: checkin.caption || '',
+        timestamp: checkin.createdAt.toISOString(),
+        likes: checkin.likes || 0,
+      }));
     }
     const ids = spots.map((item) => item.id);
 
@@ -211,6 +240,19 @@ export class PhotoSpotService {
       timestamp: checkin.createdAt.toISOString(),
       likes: checkin.likes || 0,
     }));
+  }
+
+  private async resolveRuntimePhotoSpot(photoSpotId: string): Promise<PhotoSpot | null> {
+    const parts = String(photoSpotId || '').split('|');
+    if (parts.length < 5 || parts[0] !== 'rt') {
+      return null;
+    }
+    const scenicAreaId = parts[3];
+    if (!scenicAreaId) {
+      return null;
+    }
+    const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+    return runtimeMap?.photoSpots.find((item) => item.id === photoSpotId) || null;
   }
 
   private async generateDefaultPhotoSpots(scenicAreaId: string): Promise<void> {

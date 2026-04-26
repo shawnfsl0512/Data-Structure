@@ -41,6 +41,7 @@ logs/
 # local tool folders
 .cursor/
 .trae/
+npm-cache/
 
 # OS generated files
 Thumbs.db

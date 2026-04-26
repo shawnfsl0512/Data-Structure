@@ -7,6 +7,7 @@ import { ScenicArea as ScenicAreaEntity } from '../entities/ScenicArea';
 import { User as UserEntity } from '../entities/User';
 import cache from '../config/cache';
 import { haversineDistanceKm, haversineDistanceMeters } from '../utils/geoUtils';
+import { mapTemplateRuntimeService } from './MapTemplateRuntimeService';
 
 enum Transportation {
   WALK = 'walk',
@@ -1662,9 +1663,18 @@ export class PathPlanningService {
             .getMany(),
     ]);
 
+    const targetScenicAreaIds = scenicAreaId ? [scenicAreaId] : scenicAreas.map((item) => item.id);
+    const runtimeMaps = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaIds(targetScenicAreaIds);
+    const mergedAttractions = attractions.length
+      ? attractions
+      : Array.from(runtimeMaps.values()).flatMap((item) => item.attractions);
+    const mergedFacilities = facilities.length
+      ? facilities
+      : Array.from(runtimeMaps.values()).flatMap((item) => item.facilities);
+
     const candidates: Array<NodeSearchResult & { score: number }> = [];
 
-    for (const attraction of attractions) {
+    for (const attraction of mergedAttractions) {
       const poiNode =
         this.findDirectPoiNode(
           graph,
@@ -1696,7 +1706,7 @@ export class PathPlanningService {
       });
     }
 
-    for (const facility of facilities) {
+    for (const facility of mergedFacilities) {
       const poiNode =
         this.findDirectPoiNode(
           graph,
@@ -1930,7 +1940,27 @@ export class PathPlanningService {
         const roadNodeRepo = AppDataSource.getRepository(RoadGraphNodeEntity);
         const attraction = await attractionRepo.findOne({ where: { id: attractionId } });
         if (!attraction) {
-          throw new Error('Attraction not found');
+          const runtimeAttraction = await this.findRuntimeAttractionById(attractionId);
+          if (!runtimeAttraction) {
+            throw new Error('Attraction not found');
+          }
+          const candidateNodes = graph
+            .getAllNodes()
+            .filter((item) => !runtimeAttraction.scenicAreaId || item.scenicAreaId === runtimeAttraction.scenicAreaId);
+          const nearestNode = this.findNearestNodeForLocation(
+            Number(runtimeAttraction.latitude ?? 0),
+            Number(runtimeAttraction.longitude ?? 0),
+            runtimeAttraction.scenicAreaId,
+            graph,
+          ) ?? candidateNodes[0];
+          if (!nearestNode) {
+            throw new Error('No nodes found in the road graph');
+          }
+          return {
+            attractionId,
+            nodeId: nearestNode.id,
+            scenicAreaId: nearestNode.scenicAreaId ?? null,
+          };
         }
 
         const attractionLat = Number(attraction.latitude ?? 0);
@@ -1980,6 +2010,19 @@ export class PathPlanningService {
       },
       2 * 60 * 1000,
     );
+  }
+
+  private async findRuntimeAttractionById(attractionId: string): Promise<AttractionEntity | null> {
+    const parts = String(attractionId || '').split('|');
+    if (parts.length < 5 || parts[0] !== 'rt') {
+      return null;
+    }
+    const scenicAreaId = parts[3];
+    if (!scenicAreaId) {
+      return null;
+    }
+    const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+    return runtimeMap?.attractions.find((item) => item.id === attractionId) || null;
   }
 
   async optimizeMultiPointPath(nodeIds: string[], strategy: string, transportations?: string[]) {
@@ -2065,17 +2108,22 @@ export class PathPlanningService {
       attractionRepo.find({ where: { scenicAreaId } }),
     ]);
 
-    if (!scenicAttractions.length) {
+    const effectiveAttractions =
+      scenicAttractions.length
+        ? scenicAttractions
+        : (await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId))?.attractions ?? [];
+
+    if (!effectiveAttractions.length) {
       return this.generateFallbackDayPlan(intensity);
     }
 
     const targetCount = Math.min(
-      scenicAttractions.length,
+      effectiveAttractions.length,
       intensity === 'high' ? 8 : intensity === 'medium' ? 6 : 4,
     );
     const interestSet = new Set(this.normalizeStringArray(user?.interests));
 
-    const scored = scenicAttractions
+    const scored = effectiveAttractions
       .map((item) => ({
         attraction: item,
         score: this.calculateAttractionScore(item, interestSet),
@@ -3354,6 +3402,7 @@ export class PathPlanningService {
       return null;
     }
 
+    await mapTemplateRuntimeService.ensureTemplatesPersisted();
     const nodeRepo = AppDataSource.getRepository(RoadGraphNodeEntity);
     const edgeRepo = AppDataSource.getRepository(RoadGraphEdgeEntity);
     const scenicAreaRepo = AppDataSource.getRepository(ScenicAreaEntity);
@@ -3362,7 +3411,7 @@ export class PathPlanningService {
       edgeRepo.find(),
       scenicAreaRepo.find({ select: ['id', 'category', 'name'] }),
     ]);
-    if (!nodes.length || !edges.length) {
+    if (!scenicAreas.length) {
       return null;
     }
 
@@ -3372,6 +3421,8 @@ export class PathPlanningService {
       scenicAreaCategoryMap.set(item.id, resolvedCategory);
       this.scenicAreaCategoryCache.set(item.id, resolvedCategory);
     });
+
+    const areaIdsWithDbNodes = new Set(nodes.map((item) => item.scenicAreaId));
 
     const graph = new RoadGraph();
     for (const node of nodes) {
@@ -3395,6 +3446,38 @@ export class PathPlanningService {
       );
       if (graph.getNode(mapped.from) && graph.getNode(mapped.to)) {
         this.addBidirectionalEdge(graph, mapped);
+      }
+    }
+
+    for (const scenicArea of scenicAreas) {
+      if (areaIdsWithDbNodes.has(scenicArea.id)) {
+        continue;
+      }
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicArea(scenicArea as ScenicAreaEntity);
+      if (!runtimeMap) {
+        continue;
+      }
+      for (const node of runtimeMap.roadNodes) {
+        graph.addNode({
+          id: node.id,
+          scenicAreaId: node.scenicAreaId,
+          type: node.type || 'junction',
+          name: node.name || `${DEFAULT_NODE_LABEL_PREFIX} ${node.id}`,
+          location: {
+            latitude: Number(node.latitude ?? 0),
+            longitude: Number(node.longitude ?? 0),
+          },
+        });
+      }
+      for (const edge of runtimeMap.roadEdges) {
+        const mapped = this.mapEdgeEntity(
+          edge,
+          graph,
+          scenicAreaCategoryMap.get(edge.scenicAreaId) || null,
+        );
+        if (graph.getNode(mapped.from) && graph.getNode(mapped.to)) {
+          this.addBidirectionalEdge(graph, mapped);
+        }
       }
     }
 
@@ -3610,22 +3693,6 @@ export class PathPlanningService {
     if (edge.isBicyclePath) candidates.push(Transportation.BICYCLE);
     if (edge.isElectricCartRoute) candidates.push(Transportation.ELECTRIC_CART);
 
-    const profile = this.resolvePlanningProfile(scenicAreaCategory);
-    const effectiveRoadType = inferredRoadType || edge.roadType || 'main_road';
-
-    if (profile.kind === 'campus' && effectiveRoadType !== 'footpath' && effectiveRoadType !== 'connector') {
-      candidates.push(Transportation.BICYCLE);
-    }
-    if (profile.kind === 'scenic' && effectiveRoadType !== 'footpath' && effectiveRoadType !== 'connector') {
-      candidates.push(Transportation.ELECTRIC_CART);
-    }
-
-    if (
-      profile.kind === 'generic' &&
-      (effectiveRoadType === 'main_road' || effectiveRoadType === 'side_road')
-    ) {
-      candidates.push(Transportation.BICYCLE, Transportation.ELECTRIC_CART);
-    }
     if (!candidates.length) candidates.push(Transportation.WALK);
 
     const normalized = new Set<Transportation>();
@@ -3639,6 +3706,7 @@ export class PathPlanningService {
   }
 
   private normalizeEdgeByPlanningProfile(edge: GraphEdge, scenicAreaCategory?: string | null): GraphEdge {
+    const explicitModes = collectTransportationModes(edge.allowedTransportation);
     if (edge.roadType === 'connector') {
       return {
         ...edge,
@@ -3663,10 +3731,9 @@ export class PathPlanningService {
 
       return {
         ...edge,
-        roadType: 'bicycle_path',
         congestionFactor: normalizeCongestionFactor(edge.congestionFactor),
-        allowedTransportation: [Transportation.WALK, Transportation.BICYCLE],
-        isBicyclePath: true,
+        allowedTransportation: explicitModes.length ? explicitModes : [Transportation.WALK, Transportation.BICYCLE],
+        isBicyclePath: edge.isBicyclePath || edge.roadType === 'bicycle_path',
         isElectricCartRoute: false,
       };
     }
@@ -3684,17 +3751,20 @@ export class PathPlanningService {
 
       return {
         ...edge,
-        roadType: 'electric_cart_route',
         congestionFactor: normalizeCongestionFactor(edge.congestionFactor),
-        allowedTransportation: [Transportation.WALK, Transportation.ELECTRIC_CART],
+        allowedTransportation: explicitModes.length ? explicitModes : [Transportation.WALK],
         isBicyclePath: false,
-        isElectricCartRoute: true,
+        isElectricCartRoute:
+          edge.isElectricCartRoute ||
+          explicitModes.includes(Transportation.ELECTRIC_CART) ||
+          edge.roadType === 'electric_cart_route',
       };
     }
 
     return {
       ...edge,
       congestionFactor: normalizeCongestionFactor(edge.congestionFactor),
+      allowedTransportation: explicitModes.length ? explicitModes : [Transportation.WALK],
     };
   }
 

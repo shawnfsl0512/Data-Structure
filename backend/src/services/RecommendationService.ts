@@ -10,6 +10,7 @@ import { PhotoSpot } from '../entities/PhotoSpot';
 import cache from '../config/cache';
 import { CITY_SCENIC_COORDINATE_OVERRIDES, CITY_TRAVEL_ANCHORS, CoordinatePoint } from '../data/cityTravelCoordinates';
 import { resolveScenicPresentation, ScenicPresentation } from '../utils/scenicPresentation';
+import { mapTemplateRuntimeService } from './MapTemplateRuntimeService';
 
 // 获取仓库
 function getScenicAreaRepository() {
@@ -266,6 +267,65 @@ class MinHeap<T> {
 }
 
 export class RecommendationService {
+  private async collectRuntimeMapsForScenicAreaIds(scenicAreaIds: string[]) {
+    return mapTemplateRuntimeService.getRuntimeMapForScenicAreaIds(scenicAreaIds);
+  }
+
+  private async collectAttractionsForScenicAreaIds(scenicAreaIds: string[]): Promise<Attraction[]> {
+    const attractionRepository = getAttractionRepository();
+    const dbItems = scenicAreaIds.length
+      ? await attractionRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } })
+      : await attractionRepository.find({ take: 5000 });
+    const runtimeMaps = await this.collectRuntimeMapsForScenicAreaIds(
+      scenicAreaIds.length
+        ? scenicAreaIds
+        : (await getScenicAreaRepository().find({ select: ['id'] })).map((item) => item.id),
+    );
+    const runtimeItems = Array.from(runtimeMaps.values()).flatMap((item) => item.attractions);
+    return dbItems.length ? dbItems : runtimeItems;
+  }
+
+  private async collectFacilitiesForScenicAreaIds(scenicAreaIds: string[]): Promise<Facility[]> {
+    const facilityRepository = getFacilityRepository();
+    const dbItems = scenicAreaIds.length
+      ? await facilityRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } })
+      : await facilityRepository.find();
+    const runtimeMaps = await this.collectRuntimeMapsForScenicAreaIds(
+      scenicAreaIds.length
+        ? scenicAreaIds
+        : (await getScenicAreaRepository().find({ select: ['id'] })).map((item) => item.id),
+    );
+    const runtimeItems = Array.from(runtimeMaps.values()).flatMap((item) => item.facilities);
+    return dbItems.length ? dbItems : runtimeItems;
+  }
+
+  private async collectPhotoSpotsForScenicAreaIds(scenicAreaIds: string[]): Promise<PhotoSpot[]> {
+    const photoSpotRepository = getPhotoSpotRepository();
+    const dbItems = scenicAreaIds.length
+      ? await photoSpotRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } })
+      : await photoSpotRepository.find();
+    const runtimeMaps = await this.collectRuntimeMapsForScenicAreaIds(
+      scenicAreaIds.length
+        ? scenicAreaIds
+        : (await getScenicAreaRepository().find({ select: ['id'] })).map((item) => item.id),
+    );
+    const runtimeItems = Array.from(runtimeMaps.values()).flatMap((item) => item.photoSpots);
+    return dbItems.length ? dbItems : runtimeItems;
+  }
+
+  private async collectFoodsForScenicAreaIds(
+    scenicAreaIds: string[],
+    facilities: Facility[],
+  ): Promise<Food[]> {
+    const foodRepository = getFoodRepository();
+    const dbItems = facilities.length
+      ? await foodRepository.find({ where: { facilityId: In(facilities.map((item) => item.id)) } })
+      : [];
+    const runtimeMaps = await this.collectRuntimeMapsForScenicAreaIds(scenicAreaIds);
+    const runtimeItems = Array.from(runtimeMaps.values()).flatMap((item) => item.foods);
+    return dbItems.length ? dbItems : runtimeItems;
+  }
+
   private presentScenicArea<T extends ScenicArea>(area: T): T & ScenicPresentation {
     return {
       ...area,
@@ -402,11 +462,9 @@ export class RecommendationService {
     referencePoint?: { latitude: number; longitude: number },
   ): Promise<ScoredAttractionRecommendation[]> {
     const userRepository = getUserRepository();
-    const attractionRepository = getAttractionRepository();
-
     const [user, attractions] = await Promise.all([
       userRepository.findOne({ where: { id: userId } }),
-      attractionRepository.find({ take: 5000 }),
+      this.collectAttractionsForScenicAreaIds([]),
     ]);
 
     if (!user) {
@@ -428,11 +486,9 @@ export class RecommendationService {
     limit: number = 10,
   ): Promise<ScoredAttractionRecommendation[]> {
     const userRepository = getUserRepository();
-    const attractionRepository = getAttractionRepository();
-
     const [user, attractions] = await Promise.all([
       userRepository.findOne({ where: { id: userId } }),
-      attractionRepository.find({ take: 5000 }),
+      this.collectAttractionsForScenicAreaIds([]),
     ]);
 
     if (!user) {
@@ -1125,7 +1181,14 @@ export class RecommendationService {
     }
 
     // 获取美食数据
-    const allFoods = await foodRepository.find({ where: query });
+    let allFoods = await foodRepository.find({ where: query });
+    if (!allFoods.length) {
+      const scenicAreaIds = (await getScenicAreaRepository().find({ select: ['id'] })).map((item) => item.id);
+      const runtimeMaps = await this.collectRuntimeMapsForScenicAreaIds(scenicAreaIds);
+      allFoods = Array.from(runtimeMaps.values())
+        .flatMap((item) => item.foods)
+        .filter((item) => (!cuisine || item.cuisine === cuisine));
+    }
 
     // 如果有用户ID，考虑用户兴趣
     let user;
@@ -1268,10 +1331,6 @@ export class RecommendationService {
     tripDays: number,
   ): Promise<CityTravelItinerary> {
     const scenicAreaRepository = getScenicAreaRepository();
-    const attractionRepository = getAttractionRepository();
-    const facilityRepository = getFacilityRepository();
-    const photoSpotRepository = getPhotoSpotRepository();
-    const foodRepository = getFoodRepository();
     const userRepository = getUserRepository();
 
     const user = await userRepository.findOne({ where: { id: userId } });
@@ -1297,14 +1356,12 @@ export class RecommendationService {
 
     const scenicAreaIds = cityAreas.map((area) => area.id);
     const [attractions, facilities, photoSpots] = await Promise.all([
-      attractionRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
-      facilityRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
-      photoSpotRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
+      this.collectAttractionsForScenicAreaIds(scenicAreaIds),
+      this.collectFacilitiesForScenicAreaIds(scenicAreaIds),
+      this.collectPhotoSpotsForScenicAreaIds(scenicAreaIds),
     ]);
 
-    const foods = facilities.length
-      ? await foodRepository.find({ where: { facilityId: In(facilities.map((item) => item.id)) } })
-      : [];
+    const foods = await this.collectFoodsForScenicAreaIds(scenicAreaIds, facilities);
 
     const attractionMap = this.groupByScenicArea(attractions, (item) => item.scenicAreaId);
     const facilityMap = this.groupByScenicArea(facilities, (item) => item.scenicAreaId);

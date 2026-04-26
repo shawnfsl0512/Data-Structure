@@ -14,6 +14,7 @@
     "apply-campus-template:hzau": "set DB_LOGGING=false&& ts-node src/scripts/applyHzauTemplateToCampuses.ts",
     "apply-scenic-template:hzau": "set DB_LOGGING=false&& ts-node src/scripts/applyHzauTemplateToScenicAreas.ts",
     "clear-campus-internal-data": "set DB_LOGGING=false&& ts-node src/scripts/clearCampusInternalData.ts",
+    "migrate:runtime-templates": "set DB_LOGGING=false&& ts-node src/scripts/migrateInternalMapsToRuntimeTemplates.ts",
     "repair-data:arrays": "set DB_LOGGING=false&& ts-node src/scripts/repairSerializedArrays.ts",
     "setup:data": "npm run import-data:real-template",
     "setup:data:with-covers": "npm run import-data:real-template && npm run import-covers:v2",

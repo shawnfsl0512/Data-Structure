@@ -3,6 +3,7 @@ import { AppDataSource } from '../config/database';
 import { Food } from '../entities/Food';
 import { Facility } from '../entities/Facility';
 import cache from '../config/cache';
+import { mapTemplateRuntimeService } from './MapTemplateRuntimeService';
 
 // 获取仓库
 function getFoodRepository() {
@@ -91,15 +92,33 @@ export class FoodService {
       where: { scenicAreaId }
     });
 
-    if (facilities.length === 0) {
-      return { facilities: [] };
-    }
+    let runtimeFoods: Food[] = [];
+    let effectiveFacilities = facilities;
+    let foods: Food[] = [];
 
-    const facilityIds = facilities.map(facility => facility.id);
-    const foods = await foodRepository.find({
-      where: { facilityId: In(facilityIds) },
-      relations: ['facility']
-    });
+    if (facilities.length === 0) {
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return { facilities: [] };
+      }
+      effectiveFacilities = runtimeMap.facilities;
+      runtimeFoods = runtimeMap.foods;
+      foods = runtimeFoods;
+    } else {
+      const facilityIds = facilities.map(facility => facility.id);
+      foods = await foodRepository.find({
+        where: { facilityId: In(facilityIds) },
+        relations: ['facility']
+      });
+      if (!foods.length) {
+        const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+        if (runtimeMap) {
+          const allowedIds = new Set(effectiveFacilities.map((facility) => facility.id));
+          runtimeFoods = runtimeMap.foods.filter((food) => allowedIds.has(food.facilityId));
+          foods = runtimeFoods;
+        }
+      }
+    }
 
     const foodsByFacility = new Map<string, Food[]>();
     for (const food of foods) {
@@ -109,7 +128,7 @@ export class FoodService {
     }
 
     return {
-      facilities: facilities.map(facility => ({
+      facilities: effectiveFacilities.map(facility => ({
         id: facility.id,
         name: facility.name,
         category: facility.category || 'facility',
@@ -142,7 +161,16 @@ export class FoodService {
     const facilityIds = facilities.map(facility => facility.id);
 
     if (facilityIds.length === 0) {
-      return [];
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      const filtered = cuisine
+        ? runtimeMap.foods.filter((food) => food.cuisine === cuisine)
+        : runtimeMap.foods;
+      return filtered
+        .sort((a, b) => this.calculateFoodScore(b) - this.calculateFoodScore(a))
+        .slice(0, limit);
     }
 
     // 查询条件
@@ -160,6 +188,18 @@ export class FoodService {
       where: whereCondition,
       relations: ['facility']
     });
+
+    if (!allFoods.length) {
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      const allowedIds = new Set(facilityIds);
+      const filtered = runtimeMap.foods.filter((food) => allowedIds.has(food.facilityId) && (!cuisine || food.cuisine === cuisine));
+      return filtered
+        .sort((a, b) => this.calculateFoodScore(b) - this.calculateFoodScore(a))
+        .slice(0, limit);
+    }
 
     // 使用最小堆进行Top-K推荐
     const minHeap = new MinHeap<{ score: number; food: Food }>(limit, (a, b) => a.score - b.score);
@@ -192,7 +232,13 @@ export class FoodService {
     const facilityIds = facilities.map(facility => facility.id);
 
     if (facilityIds.length === 0) {
-      return [];
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      return runtimeMap.foods
+        .filter((food) => food.name.includes(keyword))
+        .slice(0, limit);
     }
 
     // 搜索条件
@@ -204,6 +250,17 @@ export class FoodService {
       relations: ['facility'],
       take: limit
     });
+
+    if (!foods.length) {
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      const allowedIds = new Set(facilityIds);
+      return runtimeMap.foods
+        .filter((food) => allowedIds.has(food.facilityId) && food.name.includes(keyword))
+        .slice(0, limit);
+    }
 
     return foods;
   }
@@ -250,7 +307,11 @@ export class FoodService {
     const facilityIds = facilities.map(facility => facility.id);
 
     if (facilityIds.length === 0) {
-      return [];
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      return Array.from(new Set(runtimeMap.foods.map((food) => String(food.cuisine || '').trim()).filter(Boolean)));
     }
 
     // 查询所有菜系
@@ -258,6 +319,14 @@ export class FoodService {
       where: { facilityId: In(facilityIds) },
       select: ['cuisine']
     });
+
+    if (!foods.length) {
+      const runtimeMap = await mapTemplateRuntimeService.getRuntimeMapForScenicAreaId(scenicAreaId);
+      if (!runtimeMap) {
+        return [];
+      }
+      return Array.from(new Set(runtimeMap.foods.map((food) => String(food.cuisine || '').trim()).filter(Boolean)));
+    }
 
     // 去重并过滤空值
     const cuisines = [...new Set(foods.map(food => food.cuisine).filter(Boolean))];

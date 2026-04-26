@@ -6,6 +6,7 @@ import { Diary } from '../entities/Diary';
 import { DiaryComment } from '../entities/DiaryComment';
 import { Facility } from '../entities/Facility';
 import { Food } from '../entities/Food';
+import { MapTemplate } from '../entities/MapTemplate';
 import { PhotoCheckin } from '../entities/PhotoCheckin';
 import { PhotoSpot } from '../entities/PhotoSpot';
 import { RoadGraphEdge } from '../entities/RoadGraphEdge';
@@ -43,6 +44,7 @@ const createCommonOptions = () => {
       DiaryComment,
       Facility,
       Food,
+      MapTemplate,
       PhotoCheckin,
       PhotoSpot,
       RoadGraphEdge,
