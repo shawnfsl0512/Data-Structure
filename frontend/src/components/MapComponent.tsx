@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useRef } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { RoadNetworkEdge, RoadNetworkNode } from '../services/pathPlanningService';
@@ -100,15 +100,31 @@ const MARKER_STYLE: Record<string, { bg: string; border?: string; text: string; 
   return: { bg: '#7c3aed', text: 'R', ring: '0 0 0 4px rgba(124,58,237,0.18)' },
   attraction: { bg: '#7c3aed', text: '景' },
   facility: { bg: '#f59e0b', text: '设' },
+  cluster: { bg: '#2563eb', text: '' },
   waypoint: { bg: '#2563eb', text: '' },
   default: { bg: '#2563eb', text: '' },
 };
 
 const EDGE_RENDER_LIMIT = 2200;
+const MARKER_CLUSTER_THRESHOLD = 45;
 const DUPLICATE_MARKER_OFFSET = 0.00012;
 const VIEWPORT_PADDING = 0.0035;
 const DEFAULT_TOOLTIP_SIZE = { width: 200, height: 92 };
 const COMPACT_TOOLTIP_SIZE = { width: 148, height: 54 };
+const IMPORTANT_MARKER_TYPES = new Set(['start', 'end', 'return', 'waypoint']);
+const BLANK_TILE_DATA_URL =
+  'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+
+const TILE_SOURCES = {
+  street: {
+    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: 'Leaflet | OpenStreetMap contributors',
+  },
+  scenic: {
+    url: BLANK_TILE_DATA_URL,
+    attribution: 'Leaflet',
+  },
+};
 
 type TooltipPlacement = {
   direction: 'top' | 'right' | 'bottom' | 'left' | 'center' | 'auto';
@@ -136,6 +152,129 @@ const TOOLTIP_PLACEMENT_CANDIDATES: TooltipPlacement[] = [
 ];
 
 const buildMarkerKey = (position: [number, number]) => `${position[0].toFixed(6)}:${position[1].toFixed(6)}`;
+
+const escapeHtml = (value: string) =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const stripCurrentAreaPrefix = (name: string, scenicAreaName?: string | null) => {
+  const trimmed = String(name || '').trim();
+  const areaName = String(scenicAreaName || '').trim();
+  if (!trimmed || !areaName) return trimmed;
+  const separators = ['-', '－', '—', '——', '_', ' '];
+  for (const separator of separators) {
+    const prefix = `${areaName}${separator}`;
+    if (trimmed.startsWith(prefix)) {
+      return trimmed.slice(prefix.length).trim();
+    }
+  }
+  return trimmed;
+};
+
+const shortPlaceName = (name: string, maxLength = 8) => {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) return '';
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}...` : trimmed;
+};
+
+const buildClusterTooltipHtml = (bucket: MapMarker[], scenicAreaName?: string | null) => {
+  const names = bucket
+    .slice(0, 8)
+    .map((marker) => stripCurrentAreaPrefix(marker.title, scenicAreaName))
+    .filter(Boolean);
+  const remaining = Math.max(0, bucket.length - names.length);
+  return `
+    <div style="
+      min-width:176px;
+      max-width:220px;
+      color:#0f172a;
+      font-size:12px;
+      line-height:1.45;
+    ">
+      <div style="font-weight:800;margin-bottom:6px;">共 ${bucket.length} 个地点</div>
+      ${names.map((name) => `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(name)}</div>`).join('')}
+      ${remaining ? `<div style="margin-top:4px;color:#64748b;">还有 ${remaining} 个，放大后查看</div>` : ''}
+    </div>
+  `;
+};
+
+const resolveClusterGridSize = (zoomLevel: number) => {
+  if (zoomLevel >= 17) return 0;
+  if (zoomLevel >= 16) return 0.00035;
+  if (zoomLevel >= 15) return 0.0007;
+  if (zoomLevel >= 14) return 0.0012;
+  return 0.0022;
+};
+
+const buildClusteredMarkers = (
+  sourceMarkers: MapMarker[],
+  zoomLevel: number,
+  activeMarkerId: string | null,
+  shouldCluster: boolean,
+  scenicAreaName?: string | null,
+): MapMarker[] => {
+  const gridSize = shouldCluster ? resolveClusterGridSize(zoomLevel) : 0;
+  if (!gridSize || sourceMarkers.length <= MARKER_CLUSTER_THRESHOLD) {
+    return sourceMarkers;
+  }
+
+  const fixedMarkers: MapMarker[] = [];
+  const grid = new Map<string, MapMarker[]>();
+
+  sourceMarkers.forEach((marker) => {
+    if (
+      marker.id === activeMarkerId ||
+      IMPORTANT_MARKER_TYPES.has(marker.type || '') ||
+      marker.tooltipPermanent ||
+      marker.imageUrl
+    ) {
+      fixedMarkers.push(marker);
+      return;
+    }
+
+    const key = `${Math.floor(marker.position[0] / gridSize)}:${Math.floor(marker.position[1] / gridSize)}`;
+    const bucket = grid.get(key) || [];
+    bucket.push(marker);
+    grid.set(key, bucket);
+  });
+
+  const clusteredMarkers = Array.from(grid.values()).flatMap((bucket) => {
+    if (bucket.length === 1) {
+      return bucket;
+    }
+
+    const latitude = bucket.reduce((sum, marker) => sum + marker.position[0], 0) / bucket.length;
+    const longitude = bucket.reduce((sum, marker) => sum + marker.position[1], 0) / bucket.length;
+    const hasFacility = bucket.some((marker) => marker.type === 'facility');
+    const hasAttraction = bucket.some((marker) => marker.type === 'attraction');
+    const backgroundColor = hasFacility && !hasAttraction ? '#f59e0b' : hasAttraction && !hasFacility ? '#7c3aed' : '#2563eb';
+    const size = Math.min(48, 30 + Math.log(bucket.length + 1) * 7);
+
+    return [
+      {
+        id: `cluster-${bucket.map((marker) => marker.id).join('|')}`,
+        position: [latitude, longitude] as [number, number],
+        title: `${bucket.length} 个地点`,
+        type: 'cluster',
+        label: String(bucket.length),
+        disablePopup: true,
+        tooltipHtml: buildClusterTooltipHtml(bucket, scenicAreaName),
+        backgroundColor,
+        borderColor: '#ffffff',
+        textColor: '#ffffff',
+        size,
+        zIndexOffset: 260,
+        shadowColor: backgroundColor,
+      },
+    ];
+  });
+
+  return [...fixedMarkers, ...clusteredMarkers];
+};
 
 const isCompactTooltip = (tooltipHtml?: string) =>
   typeof tooltipHtml === 'string' && tooltipHtml.includes('data-compact-tooltip="1"');
@@ -337,6 +476,7 @@ const renderLegendHtml = (
   markers: MapMarker[],
   showRoadNetwork: boolean,
   pathLegendItems: PathLegendItem[],
+  collapsed: boolean,
 ) => {
   const hasWaypoint = markers.some((marker) => marker.type === 'waypoint');
   const hasReturn = markers.some((marker) => marker.type === 'return');
@@ -345,8 +485,7 @@ const renderLegendHtml = (
     return `<div><span style="display:inline-block;width:18px;height:3px;margin-right:6px;vertical-align:middle;${dashStyle}"></span>${item.label}</div>`;
   });
 
-  return [
-    '<div style="font-weight:600;margin-bottom:4px;">地图图例</div>',
+  const legendRows = [
     '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#16a34a;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">S</span>导航起点</div>',
     '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#dc2626;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">E</span>导航终点</div>',
     hasWaypoint
@@ -363,6 +502,34 @@ const renderLegendHtml = (
   ]
     .filter(Boolean)
     .join('');
+
+  return `
+    <div style="display:flex;flex-direction:column;gap:8px;min-width:${collapsed ? '92px' : '160px'};">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+        <div style="font-weight:600;white-space:nowrap;">地图图例</div>
+        <button
+          type="button"
+          data-legend-toggle="1"
+          aria-label="${collapsed ? '展开地图图例' : '收起地图图例'}"
+          style="
+            border:none;
+            background:rgba(99,102,241,0.10);
+            color:#4f46e5;
+            width:26px;
+            height:26px;
+            border-radius:999px;
+            cursor:pointer;
+            font-size:14px;
+            line-height:26px;
+            text-align:center;
+            padding:0;
+            flex:0 0 auto;
+          "
+        >${collapsed ? '▴' : '▾'}</button>
+      </div>
+      ${collapsed ? '' : `<div style="display:flex;flex-direction:column;gap:4px;">${legendRows}</div>`}
+    </div>
+  `;
 };
 
 const MapComponent: React.FC<MapComponentProps> = ({
@@ -393,6 +560,9 @@ const MapComponent: React.FC<MapComponentProps> = ({
   const legendRef = useRef<HTMLDivElement | null>(null);
   const lastViewportKeyRef = useRef('');
   const lastRenderKeyRef = useRef('');
+  const lastDataViewportKeyRef = useRef('');
+  const [currentZoom, setCurrentZoom] = useState(zoom);
+  const [legendCollapsed, setLegendCollapsed] = useState(false);
 
   const nodeMap = useMemo(() => {
     const result = new Map<string, RoadNetworkNode>();
@@ -401,6 +571,12 @@ const MapComponent: React.FC<MapComponentProps> = ({
     }
     return result;
   }, [roadNetwork]);
+
+  const clusteredMarkers = useMemo(
+    () => buildClusteredMarkers(markers, currentZoom, activeMarkerId, baseMapMode === 'scenic', scenicAreaName),
+    [activeMarkerId, baseMapMode, currentZoom, markers, scenicAreaName],
+  );
+  const shouldRenderRoadNetwork = Boolean(roadNetwork) && (baseMapMode === 'scenic' || showRoadNetwork);
 
   useEffect(() => {
     if (!mapRef.current || mapInstance.current) return;
@@ -414,10 +590,14 @@ const MapComponent: React.FC<MapComponentProps> = ({
       inertia: false,
     }).setView(center, zoom);
     mapInstance.current = map;
+    setCurrentZoom(map.getZoom());
+    map.on('zoomend', () => setCurrentZoom(map.getZoom()));
 
-    const tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: 'Leaflet | OpenStreetMap contributors',
+    const tileSource = TILE_SOURCES[baseMapMode];
+    const tileLayer = L.tileLayer(tileSource.url, {
+      attribution: tileSource.attribution,
       opacity: 1,
+      maxZoom: 20,
     }).addTo(map);
     tileLayerRef.current = tileLayer;
 
@@ -430,6 +610,8 @@ const MapComponent: React.FC<MapComponentProps> = ({
         div.style.boxShadow = '0 10px 24px rgba(0,0,0,0.12)';
         div.style.fontSize = '12px';
         div.style.lineHeight = '1.7';
+        L.DomEvent.disableClickPropagation(div);
+        L.DomEvent.disableScrollPropagation(div);
         legendRef.current = div;
         return div;
       },
@@ -447,21 +629,47 @@ const MapComponent: React.FC<MapComponentProps> = ({
 
   useEffect(() => {
     if (!legendRef.current) return;
-    legendRef.current.innerHTML = renderLegendHtml(markers, showRoadNetwork, pathLegendItems);
-  }, [markers, pathLegendItems, showRoadNetwork]);
+    legendRef.current.innerHTML = renderLegendHtml(markers, shouldRenderRoadNetwork, pathLegendItems, legendCollapsed);
+  }, [legendCollapsed, markers, pathLegendItems, shouldRenderRoadNetwork]);
+
+  useEffect(() => {
+    if (!legendRef.current) return;
+    const legendElement = legendRef.current;
+    const handleLegendClick = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-legend-toggle="1"]')) {
+        event.preventDefault();
+        event.stopPropagation();
+        setLegendCollapsed((current) => !current);
+      }
+    };
+
+    legendElement.addEventListener('click', handleLegendClick);
+    return () => {
+      legendElement.removeEventListener('click', handleLegendClick);
+    };
+  }, [legendCollapsed]);
 
   useEffect(() => {
     const map = mapInstance.current;
     const tileLayer = tileLayerRef.current;
     if (!map || !tileLayer) return;
 
+    const tileSource = TILE_SOURCES[baseMapMode];
+    tileLayer.setUrl(tileSource.url);
+    tileLayer.options.attribution = tileSource.attribution;
     tileLayer.setOpacity(1);
+    const tileContainer = tileLayer.getContainer();
+    if (tileContainer) {
+      tileContainer.style.filter = baseMapMode === 'street' ? 'saturate(0.95) brightness(1) contrast(1)' : 'none';
+      tileContainer.style.opacity = baseMapMode === 'street' ? '1' : '0';
+    }
 
     if (wrapperRef.current) {
       wrapperRef.current.style.background =
         baseMapMode === 'street'
           ? '#f8fafc'
-          : 'radial-gradient(circle at top right, rgba(37,99,235,0.1), transparent 35%), radial-gradient(circle at bottom left, rgba(13,148,136,0.1), transparent 30%), linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%)';
+          : 'radial-gradient(circle at top right, rgba(14,165,233,0.16), transparent 30%), radial-gradient(circle at bottom left, rgba(16,185,129,0.14), transparent 28%), linear-gradient(180deg, #f7fbff 0%, #eef6ff 52%, #eefbf7 100%)';
     }
   }, [baseMapMode]);
 
@@ -470,15 +678,17 @@ const MapComponent: React.FC<MapComponentProps> = ({
     if (!map) return;
 
     const renderKey = JSON.stringify({
-      markers,
+      markers: clusteredMarkers,
       path,
       routeLegs,
       congestionSegments,
       activeRouteLegId,
       focusPoints,
       showRoadNetwork,
+      shouldRenderRoadNetwork,
       baseMapMode,
       routeSource,
+      currentZoom,
     });
 
     if (lastRenderKeyRef.current === renderKey) {
@@ -503,34 +713,57 @@ const MapComponent: React.FC<MapComponentProps> = ({
 
     const routeBounds = buildBounds(routeViewportPoints);
     const viewportMarkerPoints = routeBounds
-      ? markers
+      ? clusteredMarkers
           .map((marker) => marker.position)
           .filter((point) => isInBounds(point, expandBounds(routeBounds, VIEWPORT_PADDING)))
-      : markers.map((marker) => marker.position);
+      : clusteredMarkers.map((marker) => marker.position);
+    const roadNetworkViewportPoints =
+      !routeViewportPoints.length && !viewportMarkerPoints.length && roadNetwork?.nodes?.length && roadNetwork.nodes.length <= 5000
+        ? roadNetwork.nodes
+            .filter((_node, index) => index % Math.max(1, Math.ceil(roadNetwork.nodes.length / 160)) === 0)
+            .map((node) => [node.location.latitude, node.location.longitude] as [number, number])
+        : [];
     const viewportPoints =
-      preferFocusPoints && focusPoints.length ? [...focusPoints] : [...routeViewportPoints, ...viewportMarkerPoints];
+      preferFocusPoints && focusPoints.length
+        ? [...focusPoints]
+        : [...routeViewportPoints, ...viewportMarkerPoints, ...roadNetworkViewportPoints];
     const allPoints = viewportPoints.map((point) => L.latLng(point[0], point[1]));
     const viewportKey = allPoints.map((point) => `${point.lat.toFixed(5)}:${point.lng.toFixed(5)}`).join('|');
+    const dataViewportKey = JSON.stringify({
+      center,
+      zoom,
+      focusPoints,
+      path,
+      routeLegs,
+      congestionSegments,
+      roadNodeCount: roadNetwork?.nodes.length || 0,
+      markerIds: markers.map((marker) => marker.id),
+      preferFocusPoints,
+    });
+    const shouldAutoFitViewport = lastDataViewportKeyRef.current !== dataViewportKey;
 
-    if (allPoints.length > 1) {
+    if (shouldAutoFitViewport && allPoints.length > 1) {
       if (lastViewportKeyRef.current !== viewportKey) {
         map.fitBounds(L.latLngBounds(allPoints), { padding: [32, 32] });
         lastViewportKeyRef.current = viewportKey;
       }
-    } else if (allPoints.length === 1) {
+    } else if (shouldAutoFitViewport && allPoints.length === 1) {
       if (lastViewportKeyRef.current !== viewportKey) {
         map.setView(allPoints[0], focusZoom ?? zoom);
         lastViewportKeyRef.current = viewportKey;
       }
-    } else {
+    } else if (shouldAutoFitViewport) {
       const fallbackKey = `${center[0].toFixed(5)}:${center[1].toFixed(5)}:${zoom}`;
       if (lastViewportKeyRef.current !== fallbackKey) {
         map.setView(center, zoom);
         lastViewportKeyRef.current = fallbackKey;
       }
     }
+    if (shouldAutoFitViewport) {
+      lastDataViewportKeyRef.current = dataViewportKey;
+    }
 
-    if (showRoadNetwork && roadNetwork) {
+    if (shouldRenderRoadNetwork && roadNetwork) {
       const renderBounds = buildBounds(viewportPoints);
       let renderedCount = 0;
 
@@ -671,7 +904,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
     }
 
     const markerCountByPosition = new Map<string, number>();
-    const markerRenderEntries = markers.map((marker) => {
+    const markerRenderEntries = clusteredMarkers.map((marker) => {
       const key = buildMarkerKey(marker.position);
       const duplicateIndex = markerCountByPosition.get(key) || 0;
       markerCountByPosition.set(key, duplicateIndex + 1);
@@ -688,15 +921,19 @@ const MapComponent: React.FC<MapComponentProps> = ({
     for (const marker of markerRenderEntries) {
       const style = MARKER_STYLE[marker.type || 'default'] || MARKER_STYLE.default;
 
-      const label = marker.label ?? style.text;
+      const isPlaceMarker = marker.type === 'attraction' || marker.type === 'facility';
+      const displayTitle = isPlaceMarker ? stripCurrentAreaPrefix(marker.title, scenicAreaName) : marker.title;
+      const label = marker.label ?? (isPlaceMarker ? shortPlaceName(displayTitle) : style.text);
       const isActiveMarker = activeMarkerId === marker.id;
-      const markerSize = marker.size ?? (isActiveMarker ? 36 : 30);
+      const markerSize = marker.size ?? (isActiveMarker ? 36 : isPlaceMarker ? 32 : 30);
       const backgroundColor = marker.backgroundColor || style.bg;
       const borderColor = marker.borderColor || style.border || '#fff';
       const textColor = marker.textColor || (style.border ? style.border : '#fff');
       const markerOpacity = marker.opacity ?? 1;
       const isWideLabel = String(label || '').length > 1;
-      const markerWidth = isWideLabel ? Math.max(markerSize + 8, String(label).length * 10 + 14) : markerSize;
+      const markerWidth = isWideLabel
+        ? Math.max(markerSize + 18, Math.min(116, String(label).length * 13 + 24))
+        : markerSize;
       const markerHeight = markerSize;
       const markerShadowColor = marker.shadowColor || backgroundColor;
       const safeImageUrl = marker.imageUrl?.replace(/'/g, '&#39;');
@@ -754,8 +991,11 @@ const MapComponent: React.FC<MapComponentProps> = ({
             display:flex;
             align-items:center;
             justify-content:center;
-            padding:${isWideLabel ? '0 8px' : '0'};
-            letter-spacing:${isWideLabel ? '0.2px' : '0'};
+            padding:${isWideLabel ? '0 10px' : '0'};
+            letter-spacing:0;
+            white-space:nowrap;
+            overflow:hidden;
+            text-overflow:ellipsis;
             opacity:${markerOpacity};
             box-shadow:${isActiveMarker ? '0 0 0 5px rgba(37,99,235,0.18), 0 12px 28px rgba(15,23,42,0.28)' : style.ring || '0 6px 16px rgba(15,23,42,0.24)'};
             transform:${isActiveMarker ? 'scale(1.05)' : 'scale(1)'};
@@ -779,11 +1019,12 @@ const MapComponent: React.FC<MapComponentProps> = ({
       }).addTo(map);
 
       if (marker.title && !marker.disablePopup) {
-        markerLayer.bindPopup(marker.title);
+        markerLayer.bindPopup(displayTitle || marker.title);
       }
 
-      if (marker.tooltipHtml) {
-        markerLayer.bindTooltip(marker.tooltipHtml, {
+      const tooltipHtml = marker.tooltipHtml || '';
+      if (tooltipHtml) {
+        markerLayer.bindTooltip(tooltipHtml, {
           permanent: marker.tooltipPermanent ?? false,
           direction: dynamicTooltipPlacement?.direction || marker.tooltipDirection || 'top',
           offset: dynamicTooltipPlacement
@@ -796,7 +1037,11 @@ const MapComponent: React.FC<MapComponentProps> = ({
         });
       }
 
-      if (onMarkerSelect) {
+      if (marker.type === 'cluster') {
+        markerLayer.on('click', () => {
+          map.setView(marker.adjustedPosition, Math.min(map.getZoom() + 2, 19), { animate: true });
+        });
+      } else if (onMarkerSelect) {
         markerLayer.on('click', () => onMarkerSelect(marker));
       }
 
@@ -808,7 +1053,8 @@ const MapComponent: React.FC<MapComponentProps> = ({
     congestionSegments,
     focusPoints,
     activeMarkerId,
-    markers,
+    clusteredMarkers,
+    baseMapMode,
     nodeMap,
     onMarkerSelect,
     path,
@@ -817,6 +1063,8 @@ const MapComponent: React.FC<MapComponentProps> = ({
     routeSource,
     showDirectionArrows,
     showRoadNetwork,
+    shouldRenderRoadNetwork,
+    scenicAreaName,
     focusZoom,
     preferFocusPoints,
     zoom,

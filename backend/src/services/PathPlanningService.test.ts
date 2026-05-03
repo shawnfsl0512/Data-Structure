@@ -161,7 +161,7 @@ describe('PathPlanningService mixed transportation planning', () => {
 
     expect(result.path).toEqual(['A', 'J1', 'K1', 'J2', 'B']);
     expect(result.distance).toBeCloseTo(280, 2);
-    expect(result.time).toBeCloseTo(1.49, 2);
+    expect(result.time).toBeCloseTo(1.5, 2);
     expect(result.transportationModes).toEqual(['walk', 'bicycle']);
     expect(result.isMixedTransportation).toBe(true);
     expect(result.segments.map((segment: any) => segment.transportation)).toEqual([

@@ -208,11 +208,22 @@ const normalizeCongestionFactor = (value: number): number => {
 class RoadGraph {
   private readonly nodes = new Map<string, GraphNode>();
   private readonly outgoingEdges = new Map<string, GraphEdge[]>();
+  private readonly incomingEdges = new Map<string, GraphEdge[]>();
+  private readonly nodesByScenicArea = new Map<string, GraphNode[]>();
+  private readonly edgesByScenicArea = new Map<string, GraphEdge[]>();
 
   addNode(node: GraphNode): void {
     this.nodes.set(node.id, node);
     if (!this.outgoingEdges.has(node.id)) {
       this.outgoingEdges.set(node.id, []);
+    }
+    if (!this.incomingEdges.has(node.id)) {
+      this.incomingEdges.set(node.id, []);
+    }
+    if (node.scenicAreaId) {
+      const scopedNodes = this.nodesByScenicArea.get(node.scenicAreaId) || [];
+      scopedNodes.push(node);
+      this.nodesByScenicArea.set(node.scenicAreaId, scopedNodes);
     }
   }
 
@@ -221,6 +232,15 @@ class RoadGraph {
       this.outgoingEdges.set(edge.from, []);
     }
     this.outgoingEdges.get(edge.from)?.push(edge);
+    if (!this.incomingEdges.has(edge.to)) {
+      this.incomingEdges.set(edge.to, []);
+    }
+    this.incomingEdges.get(edge.to)?.push(edge);
+    if (edge.scenicAreaId) {
+      const scopedEdges = this.edgesByScenicArea.get(edge.scenicAreaId) || [];
+      scopedEdges.push(edge);
+      this.edgesByScenicArea.set(edge.scenicAreaId, scopedEdges);
+    }
   }
 
   hasDirectedEdge(from: string, to: string): boolean {
@@ -231,6 +251,13 @@ class RoadGraph {
     return Array.from(this.nodes.values());
   }
 
+  getNodesByScenicArea(scenicAreaId?: string | null): GraphNode[] {
+    if (!scenicAreaId) {
+      return this.getAllNodes();
+    }
+    return this.nodesByScenicArea.get(scenicAreaId) ?? [];
+  }
+
   getNode(nodeId: string): GraphNode | undefined {
     return this.nodes.get(nodeId);
   }
@@ -239,12 +266,23 @@ class RoadGraph {
     return this.outgoingEdges.get(fromNodeId) ?? [];
   }
 
+  getIncidentEdges(nodeId: string): GraphEdge[] {
+    return [...(this.outgoingEdges.get(nodeId) ?? []), ...(this.incomingEdges.get(nodeId) ?? [])];
+  }
+
   getAllEdges(): GraphEdge[] {
     const edges: GraphEdge[] = [];
     for (const node of this.getAllNodes()) {
       edges.push(...this.getEdges(node.id));
     }
     return edges;
+  }
+
+  getEdgesByScenicArea(scenicAreaId?: string | null): GraphEdge[] {
+    if (!scenicAreaId) {
+      return this.getAllEdges();
+    }
+    return this.edgesByScenicArea.get(scenicAreaId) ?? [];
   }
 }
 
@@ -326,8 +364,16 @@ class PathPlanner {
     strategy: PathStrategy,
     allowedTransportation: Transportation[],
   ): PathResult {
-    const nodes = this.graph.getAllNodes();
-    if (!nodes.length || !this.graph.getNode(startNodeId) || !this.graph.getNode(endNodeId)) {
+    const startNode = this.graph.getNode(startNodeId);
+    const endNode = this.graph.getNode(endNodeId);
+    if (!startNode || !endNode) {
+      return { path: [], totalDistance: 0, totalTime: 0 };
+    }
+    const nodes =
+      startNode.scenicAreaId && startNode.scenicAreaId === endNode.scenicAreaId
+        ? this.getScopedNodes(startNode.scenicAreaId)
+        : this.graph.getAllNodes();
+    if (!nodes.length) {
       return { path: [], totalDistance: 0, totalTime: 0 };
     }
 
@@ -513,6 +559,12 @@ class PathPlanner {
     const baseMinutes = edge.distance / speedMeterPerMinute;
     const congestion = normalizeCongestionFactor(Number(edge.congestionFactor ?? 1));
     return baseMinutes / Math.max(congestion, 0.05);
+  }
+
+  private getScopedNodes(scenicAreaId: string): GraphNode[] {
+    return typeof (this.graph as any).getNodesByScenicArea === 'function'
+      ? this.graph.getNodesByScenicArea(scenicAreaId)
+      : this.graph.getAllNodes().filter((node) => node.scenicAreaId === scenicAreaId);
   }
 }
 
@@ -944,8 +996,7 @@ export class PathPlanningService {
     const anchorLat = Number(node.location.latitude || 0);
     const anchorLng = Number(node.location.longitude || 0);
 
-    const candidates = graph
-      .getAllNodes()
+    const candidates = this.getScopedGraphNodes(graph, node.scenicAreaId)
       .filter((item) => item.scenicAreaId === node.scenicAreaId && item.type === 'junction')
       .map((item) => ({
         node: item,
@@ -1047,14 +1098,16 @@ export class PathPlanningService {
         candidates.push(hybridRoute);
       }
 
-      const directRoadRoute = await this.tryBuildBestDirectRoadRoute(
-        resolvedStartNodeId,
-        resolvedEndNodeId,
-        vehicleTransportations,
-        parsedStrategy,
-      );
-      if (directRoadRoute?.segments?.length) {
-        candidates.push(directRoadRoute);
+      if (profile.kind === 'generic') {
+        const directRoadRoute = await this.tryBuildBestDirectRoadRoute(
+          resolvedStartNodeId,
+          resolvedEndNodeId,
+          vehicleTransportations,
+          parsedStrategy,
+        );
+        if (directRoadRoute?.segments?.length) {
+          candidates.push(directRoadRoute);
+        }
       }
 
       if (scopedTransportations.includes(Transportation.WALK)) {
@@ -1194,7 +1247,7 @@ export class PathPlanningService {
             ? null
             : await this.tryBuildWalkConnectorPath(endAnchor.id, endNode.id);
 
-        const mainRoute = await this.tryBuildDirectRoadRoute(startAnchor.id, endAnchor.id, transportation);
+        const mainRoute = await this.tryBuildGraphVehicleRoute(startAnchor.id, endAnchor.id, transportation, strategy);
         if (!mainRoute) {
           continue;
         }
@@ -1229,7 +1282,7 @@ export class PathPlanningService {
           time: Number(totalTime.toFixed(2)),
           segments: mergedSegments,
           routeGeometry: this.mergePathPoints((visibleSegments.length ? visibleSegments : mergedSegments).map((item) => item.pathPoints)),
-          routeSource: 'osrm',
+          routeSource: 'graph',
           routeContext,
           transportationModes: usedTransportation,
           isMixedTransportation: usedTransportation.length > 1,
@@ -1266,6 +1319,24 @@ export class PathPlanningService {
     }
   }
 
+  private async tryBuildGraphVehicleRoute(
+    startNodeId: string,
+    endNodeId: string,
+    transportation: Transportation.BICYCLE | Transportation.ELECTRIC_CART,
+    strategy: PathStrategy,
+  ): Promise<PathResponse | null> {
+    try {
+      return await this.buildPathResponse(
+        startNodeId,
+        endNodeId,
+        strategy,
+        [transportation],
+      );
+    } catch {
+      return null;
+    }
+  }
+
   private findAccessibleJunctionCandidates(
     sourceNode: GraphNode,
     transportation: Transportation.BICYCLE | Transportation.ELECTRIC_CART,
@@ -1275,8 +1346,7 @@ export class PathPlanningService {
       return [sourceNode];
     }
 
-    return graph
-      .getAllNodes()
+    return this.getScopedGraphNodes(graph, sourceNode.scenicAreaId)
       .filter(
         (item) =>
           item.type === 'junction' &&
@@ -1302,7 +1372,11 @@ export class PathPlanningService {
     transportation: Transportation.BICYCLE | Transportation.ELECTRIC_CART,
     graph: RoadGraph,
   ): boolean {
-    return graph.getEdges(nodeId).some((edge) => {
+    const incidentEdges =
+      typeof (graph as any).getIncidentEdges === 'function'
+        ? graph.getIncidentEdges(nodeId)
+        : [...graph.getEdges(nodeId), ...graph.getAllEdges().filter((edge) => edge.to === nodeId)];
+    return incidentEdges.some((edge) => {
       if (edge.roadType === 'connector' || edge.roadType === 'footpath') {
         return false;
       }
@@ -1314,6 +1388,24 @@ export class PathPlanningService {
       }
       return edge.isElectricCartRoute || edge.roadType === 'main_road' || edge.roadType === 'side_road';
     });
+  }
+
+  private getScopedGraphNodes(graph: RoadGraph, scenicAreaId?: string | null): GraphNode[] {
+    if (!scenicAreaId) {
+      return graph.getAllNodes();
+    }
+    return typeof (graph as any).getNodesByScenicArea === 'function'
+      ? graph.getNodesByScenicArea(scenicAreaId)
+      : graph.getAllNodes().filter((node) => node.scenicAreaId === scenicAreaId);
+  }
+
+  private getScopedGraphEdges(graph: RoadGraph, scenicAreaId?: string | null): GraphEdge[] {
+    if (!scenicAreaId) {
+      return graph.getAllEdges();
+    }
+    return typeof (graph as any).getEdgesByScenicArea === 'function'
+      ? graph.getEdgesByScenicArea(scenicAreaId)
+      : graph.getAllEdges().filter((edge) => edge.scenicAreaId === scenicAreaId);
   }
 
   private async tryBuildBestDirectRoadRoute(
@@ -1357,9 +1449,8 @@ export class PathPlanningService {
           return { nodes: graph.getAllNodes(), edges: graph.getAllEdges(), planningProfile };
         }
 
-        const nodes = graph.getAllNodes().filter((node) => node.scenicAreaId === normalizedScenicAreaId);
-        const nodeIds = new Set(nodes.map((node) => node.id));
-        const edges = graph.getAllEdges().filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+        const nodes = this.getScopedGraphNodes(graph, normalizedScenicAreaId);
+        const edges = this.getScopedGraphEdges(graph, normalizedScenicAreaId);
         return { nodes, edges, planningProfile };
       },
       5 * 60 * 1000,
@@ -1372,7 +1463,7 @@ export class PathPlanningService {
     const normalized = keyword.trim().toLowerCase();
     const normalizedScenicAreaId = typeof scenicAreaId === 'string' && scenicAreaId.trim() ? scenicAreaId.trim() : '';
     const allNodes = normalizedScenicAreaId
-      ? graph.getAllNodes().filter((node) => node.scenicAreaId === normalizedScenicAreaId)
+      ? this.getScopedGraphNodes(graph, normalizedScenicAreaId)
       : graph.getAllNodes();
     if (!allNodes.length) {
       return [];
@@ -1764,9 +1855,7 @@ export class PathPlanningService {
     scenicAreaId: string | undefined,
     graph: RoadGraph,
   ): GraphNode | undefined {
-    const scopedNodes = scenicAreaId
-      ? graph.getAllNodes().filter((item) => item.scenicAreaId === scenicAreaId)
-      : graph.getAllNodes();
+    const scopedNodes = scenicAreaId ? this.getScopedGraphNodes(graph, scenicAreaId) : graph.getAllNodes();
     if (!scopedNodes.length) {
       return undefined;
     }
@@ -1892,7 +1981,7 @@ export class PathPlanningService {
           const scopedNodes =
             scopedScenicAreaId === 'all'
               ? graph.getAllNodes()
-              : graph.getAllNodes().filter((item) => item.scenicAreaId === scopedScenicAreaId);
+              : this.getScopedGraphNodes(graph, scopedScenicAreaId);
           nearestNode = this.findNearestNonScenicNode(latitude, longitude, scopedNodes) || nearestNode;
         }
 
@@ -2465,9 +2554,7 @@ export class PathPlanningService {
         ? startNode.scenicAreaId
         : startNode.scenicAreaId || endNode.scenicAreaId || null;
 
-    const candidateNodes = scenicAreaId
-      ? graph.getAllNodes().filter((item) => item.scenicAreaId === scenicAreaId)
-      : [startNode, endNode];
+    const candidateNodes = scenicAreaId ? this.getScopedGraphNodes(graph, scenicAreaId) : [startNode, endNode];
     const bounds = this.calculateRouteBounds(candidateNodes.map((item) => item.location));
 
     let scenicAreaName: string | null = null;
@@ -3409,7 +3496,9 @@ export class PathPlanningService {
     const [nodes, edges, scenicAreas] = await Promise.all([
       nodeRepo.find(),
       edgeRepo.find(),
-      scenicAreaRepo.find({ select: ['id', 'category', 'name'] }),
+      scenicAreaRepo.find({
+        select: ['id', 'name', 'category', 'city', 'latitude', 'longitude', 'createdAt', 'updatedAt'],
+      }),
     ]);
     if (!scenicAreas.length) {
       return null;
@@ -3457,8 +3546,9 @@ export class PathPlanningService {
       if (!runtimeMap) {
         continue;
       }
+      const runtimeJunctionNodes: GraphNode[] = [];
       for (const node of runtimeMap.roadNodes) {
-        graph.addNode({
+        const graphNode: GraphNode = {
           id: node.id,
           scenicAreaId: node.scenicAreaId,
           type: node.type || 'junction',
@@ -3467,8 +3557,68 @@ export class PathPlanningService {
             latitude: Number(node.latitude ?? 0),
             longitude: Number(node.longitude ?? 0),
           },
+        };
+        graph.addNode(graphNode);
+        if (graphNode.type === 'junction') {
+          runtimeJunctionNodes.push(graphNode);
+        }
+      }
+
+      const poiNodes: GraphNode[] = [
+        ...runtimeMap.attractions.map((attraction) => ({
+          id: attraction.id,
+          scenicAreaId: attraction.scenicAreaId,
+          type: 'attraction',
+          name: attraction.name,
+          location: {
+            latitude: Number(attraction.latitude ?? 0),
+            longitude: Number(attraction.longitude ?? 0),
+          },
+        })),
+        ...runtimeMap.facilities.map((facility) => ({
+          id: facility.id,
+          scenicAreaId: facility.scenicAreaId,
+          type: 'facility',
+          name: facility.name,
+          location: {
+            latitude: Number(facility.latitude ?? 0),
+            longitude: Number(facility.longitude ?? 0),
+          },
+        })),
+      ];
+
+      for (const poiNode of poiNodes) {
+        graph.addNode(poiNode);
+      }
+
+      for (const poiNode of poiNodes) {
+        const nearestJunction = this.findNearestJunctionNodeInCandidates(poiNode, runtimeJunctionNodes);
+        if (!nearestJunction) {
+          continue;
+        }
+        const distance = haversineDistanceMeters(
+          Number(poiNode.location.latitude || 0),
+          Number(poiNode.location.longitude || 0),
+          Number(nearestJunction.location.latitude || 0),
+          Number(nearestJunction.location.longitude || 0),
+        );
+        if (!Number.isFinite(distance) || distance <= 0) {
+          continue;
+        }
+        this.addBidirectionalEdge(graph, {
+          id: `rt|${runtimeMap.templateKey}|poi-connector|${scenicArea.id}|${poiNode.id}|${nearestJunction.id}`,
+          scenicAreaId: scenicArea.id,
+          from: poiNode.id,
+          to: nearestJunction.id,
+          distance: Number(distance.toFixed(2)),
+          roadType: 'connector',
+          congestionFactor: 1,
+          allowedTransportation: [Transportation.WALK],
+          isElectricCartRoute: false,
+          isBicyclePath: false,
         });
       }
+
       for (const edge of runtimeMap.roadEdges) {
         const mapped = this.mapEdgeEntity(
           edge,
@@ -3628,10 +3778,14 @@ export class PathPlanningService {
   }
 
   private findNearestJunctionNodeForAnchor(anchorNode: GraphNode, graph: RoadGraph): GraphNode | null {
+    return this.findNearestJunctionNodeInCandidates(anchorNode, graph.getAllNodes());
+  }
+
+  private findNearestJunctionNodeInCandidates(anchorNode: GraphNode, candidates: GraphNode[]): GraphNode | null {
     let nearestNode: GraphNode | null = null;
     let nearestDistance = Number.POSITIVE_INFINITY;
 
-    for (const candidate of graph.getAllNodes()) {
+    for (const candidate of candidates) {
       if (candidate.id === anchorNode.id || candidate.type !== 'junction') {
         continue;
       }

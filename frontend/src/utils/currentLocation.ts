@@ -34,7 +34,7 @@ export const resolveCurrentLocationErrorMessage = (error?: GeolocationPositionEr
   }
 
   if (error.code === error.POSITION_UNAVAILABLE) {
-    return '当前无法确定你的位置信息，请稍后重试。';
+    return '当前无法确定你的位置，请稍后重试。';
   }
 
   if (error.code === error.TIMEOUT) {

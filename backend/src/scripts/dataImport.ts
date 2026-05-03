@@ -154,6 +154,10 @@ const CITY_CENTERS: Record<string, LatLng> = {
   天津: { latitude: 39.0842, longitude: 117.2009 },
 };
 
+const SCENIC_CENTER_OVERRIDES: Record<string, LatLng> = {
+  北京邮电大学: { latitude: 40.156883, longitude: 116.284066 },
+};
+
 const FACILITY_CATEGORIES = [
   '商店',
   '饭店',
@@ -418,6 +422,11 @@ const createGridNodes = (scenicId: string, scenicName: string, center: LatLng): 
 };
 
 const createScenicCenter = (item: ScenicCatalogEntry, scenicIndex: number, cityOrdinal: number): LatLng => {
+  const overriddenCenter = SCENIC_CENTER_OVERRIDES[item.name];
+  if (overriddenCenter) {
+    return overriddenCenter;
+  }
+
   const cityCenter = CITY_CENTERS[item.city] ?? CITY_CENTERS['北京'];
   const baseRadius = item.category === '校园' ? 0.012 : 0.018;
   const spreadRadius = baseRadius + (cityOrdinal % 5) * 0.006 + rng.float(0.002, 0.01);

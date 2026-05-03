@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { App as AntdApp, AutoComplete, Button, Card, Checkbox, Col, Empty, Radio, Row, Space, Spin, Switch, Tag, Typography } from 'antd';
 import { AimOutlined, PlusOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -38,6 +38,11 @@ interface MultiPreview {
   paths: Path[];
   strategy: MultiPointStrategy;
   transportationModes: TransportType[];
+}
+
+interface CurrentLocationResolution {
+  option: SearchOption;
+  warning?: string | null;
 }
 
 interface RouteLeg {
@@ -104,6 +109,9 @@ const pretty = (value?: string | null) => (value || '').trim() || '未命名地�
 const formatDistance = (distance: number) => `${Number(distance || 0).toFixed(1)} 米`;
 const formatTime = (minutes: number) => `${Number(minutes || 0).toFixed(1)} 分钟`;
 
+const SEARCH_RESULT_LIMIT = 50;
+const CURRENT_LOCATION_DISTANCE_WARNING_METERS = 1500;
+
 const nodeToOption = (node: RoadNetworkNode): SearchOption => ({
   value: node.id,
   label: pretty(node.name),
@@ -134,6 +142,78 @@ const findBestNamedOption = (options: SearchOption[], keyword: string) => {
     options[0] ||
     null
   );
+};
+
+const isUserSelectablePlace = (item: SearchOption) => item.placeType !== 'junction';
+
+const stripPlaceNamePrefix = (name: string, scenicAreaName?: string | null) => {
+  const trimmedName = pretty(name);
+  const trimmedAreaName = (scenicAreaName || '').trim();
+  if (!trimmedAreaName) return trimmedName;
+
+  const prefix = `${trimmedAreaName}-`;
+  return trimmedName.startsWith(prefix) ? trimmedName.slice(prefix.length) : trimmedName;
+};
+
+const normalizeSearchText = (value?: string | null) => (value || '').trim().toLowerCase();
+
+const getSearchOptionTexts = (item: SearchOption, scenicAreaName?: string | null) => {
+  const values = [
+    item.placeName,
+    item.label,
+    stripPlaceNamePrefix(item.placeName, scenicAreaName),
+    stripPlaceNamePrefix(item.label, scenicAreaName),
+  ]
+    .map((value) => normalizeSearchText(value))
+    .filter(Boolean);
+
+  return Array.from(new Set(values));
+};
+
+const scoreSearchOption = (item: SearchOption, keyword: string, scenicAreaName?: string | null) => {
+  const normalizedKeyword = normalizeSearchText(keyword);
+  if (!normalizedKeyword) return 0;
+
+  const texts = getSearchOptionTexts(item, scenicAreaName);
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  texts.forEach((text) => {
+    if (text === normalizedKeyword) {
+      bestScore = Math.min(bestScore, 0);
+      return;
+    }
+    if (text.startsWith(normalizedKeyword)) {
+      bestScore = Math.min(bestScore, 100 + text.length);
+      return;
+    }
+    const includeIndex = text.indexOf(normalizedKeyword);
+    if (includeIndex >= 0) {
+      bestScore = Math.min(bestScore, 1000 + includeIndex * 10 + text.length);
+    }
+  });
+
+  return Number.isFinite(bestScore) ? bestScore : Number.POSITIVE_INFINITY;
+};
+
+const matchesSearchOption = (item: SearchOption, keyword: string, scenicAreaName?: string | null) =>
+  !normalizeSearchText(keyword) || Number.isFinite(scoreSearchOption(item, keyword, scenicAreaName));
+
+const sortSearchOptions = (options: SearchOption[], keyword: string, scenicAreaName?: string | null) => {
+  const deduped = Array.from(new Map(options.map((item) => [item.value, item])).values());
+  const normalizedKeyword = normalizeSearchText(keyword);
+  if (!normalizedKeyword) return deduped;
+
+  return deduped.sort((left, right) => {
+    const leftScore = scoreSearchOption(left, normalizedKeyword, scenicAreaName);
+    const rightScore = scoreSearchOption(right, normalizedKeyword, scenicAreaName);
+    if (leftScore !== rightScore) return leftScore - rightScore;
+
+    const leftDisplay = stripPlaceNamePrefix(left.placeName || left.label, scenicAreaName);
+    const rightDisplay = stripPlaceNamePrefix(right.placeName || right.label, scenicAreaName);
+    if (leftDisplay.length !== rightDisplay.length) return leftDisplay.length - rightDisplay.length;
+
+    return leftDisplay.localeCompare(rightDisplay, 'zh-CN');
+  });
 };
 
 const parseCityDayRoutePayload = (raw: string): CityDayRoutePayloadStop[] => {
@@ -307,14 +387,17 @@ const PathPlanningPage: React.FC = () => {
   const [targetOptions, setTargetOptions] = useState<SearchOption[]>([]);
   const [selectedStart, setSelectedStart] = useState<SearchOption | null>(null);
   const [selectedEnd, setSelectedEnd] = useState<SearchOption | null>(null);
+  const [selectedTargetOption, setSelectedTargetOption] = useState<SearchOption | null>(null);
   const [selectedTargets, setSelectedTargets] = useState<SearchOption[]>([]);
 
   const [searchingStart, setSearchingStart] = useState(false);
   const [searchingEnd, setSearchingEnd] = useState(false);
   const [searchingTarget, setSearchingTarget] = useState(false);
+  const [startDropdownOpen, setStartDropdownOpen] = useState(false);
+  const [endDropdownOpen, setEndDropdownOpen] = useState(false);
+  const [targetDropdownOpen, setTargetDropdownOpen] = useState(false);
 
   const [multiPointMode, setMultiPointMode] = useState(false);
-  const [returnToStart, setReturnToStart] = useState(false);
   const [strategy, setStrategy] = useState<MultiPointStrategy>('shortest_time');
   const [transportModes, setTransportModes] = useState<TransportType[]>(['walk']);
   const [transportationPath, setTransportationPath] = useState<Path | null>(null);
@@ -341,14 +424,16 @@ const PathPlanningPage: React.FC = () => {
   const startTimerRef = useRef<number | null>(null);
   const endTimerRef = useRef<number | null>(null);
   const targetTimerRef = useRef<number | null>(null);
+  const startSearchSeqRef = useRef(0);
+  const endSearchSeqRef = useRef(0);
+  const targetSearchSeqRef = useRef(0);
   const initSignatureRef = useRef<string>('');
   const dayRouteInitSignatureRef = useRef<string>('');
   const autoPlanTriggeredRef = useRef(false);
   const singleEndDraftRef = useRef<{ input: string; option: SearchOption | null }>({ input: '', option: null });
-  const multiTargetDraftRef = useRef<{ input: string; options: SearchOption[]; returnToStart: boolean }>({
+  const multiTargetDraftRef = useRef<{ input: string; options: SearchOption[] }>({
     input: '',
     options: [],
-    returnToStart: false,
   });
 
   const scenicSelfOption = useMemo<SearchOption | null>(() => {
@@ -376,6 +461,10 @@ const PathPlanningPage: React.FC = () => {
     ],
     [localOptions],
   );
+  const defaultLocalOptions = useMemo(() => {
+    const userSelectable = preferredLocalOptions.filter(isUserSelectablePlace);
+    return userSelectable.length ? userSelectable : preferredLocalOptions;
+  }, [preferredLocalOptions]);
   const optionRegistry = useMemo(() => {
     const map = new Map<string, SearchOption>();
     [...localOptions, ...startOptions, ...endOptions, ...targetOptions, ...selectedTargets, ...(selectedStart ? [selectedStart] : []), ...(selectedEnd ? [selectedEnd] : [])].forEach((item) => map.set(item.value, item));
@@ -388,6 +477,48 @@ const PathPlanningPage: React.FC = () => {
       if (item?.value) map.set(item.value, item);
     });
     return Array.from(map.values());
+  };
+
+  const displayPlaceName = (item?: Pick<SearchOption, 'placeName' | 'label'> | null) =>
+    stripPlaceNamePrefix(item?.placeName || item?.label || '', scenicAreaName);
+
+  const setOptionsByTarget = (target: 'start' | 'end' | 'target', options: SearchOption[]) => {
+    if (target === 'start') setStartOptions(options);
+    if (target === 'end') setEndOptions(options);
+    if (target === 'target') setTargetOptions(options);
+  };
+
+  const getSearchSeqRef = (target: 'start' | 'end' | 'target') =>
+    target === 'start' ? startSearchSeqRef : target === 'end' ? endSearchSeqRef : targetSearchSeqRef;
+
+  const buildLocalSearchOptions = (keyword: string, target: 'start' | 'end' | 'target') => {
+    const scopedScenicName = scenicAreaName || routeContext?.scenicAreaName;
+    const normalizedKeyword = normalizeSearchText(keyword);
+    const baseOptions = normalizedKeyword
+      ? defaultLocalOptions.filter((item) => matchesSearchOption(item, normalizedKeyword, scopedScenicName))
+      : defaultLocalOptions;
+    const sorted = normalizedKeyword ? sortSearchOptions(baseOptions, normalizedKeyword, scopedScenicName) : baseOptions;
+
+    if (target === 'start' && selectedStart) {
+      return mergeOptions(sorted, selectedStart);
+    }
+    if (target === 'end' && selectedEnd) {
+      return mergeOptions(sorted, selectedEnd);
+    }
+    if (target === 'target' && selectedTargets.length) {
+      return mergeOptions(sorted, ...selectedTargets);
+    }
+    return sorted;
+  };
+
+  const applyLocalSearchOptions = (keyword: string, target: 'start' | 'end' | 'target') => {
+    setOptionsByTarget(target, buildLocalSearchOptions(keyword, target));
+  };
+
+  const setDropdownOpenByTarget = (target: 'start' | 'end' | 'target', open: boolean) => {
+    if (target === 'start') setStartDropdownOpen(open);
+    if (target === 'end') setEndDropdownOpen(open);
+    if (target === 'target') setTargetDropdownOpen(open);
   };
 
   const routePaths = useMemo(() => (multiPreview ? multiPreview.paths : transportationPath ? [transportationPath] : []), [multiPreview, transportationPath]);
@@ -436,11 +567,11 @@ const PathPlanningPage: React.FC = () => {
   }, [message, scenicAreaId]);
 
   useEffect(() => {
-    if (!localOptions.length) return;
-    setStartOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
-    setEndOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
-    setTargetOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
-  }, [preferredLocalOptions]);
+    if (!defaultLocalOptions.length) return;
+    setStartOptions(mergeOptions(defaultLocalOptions, selectedStart));
+    setEndOptions(mergeOptions(defaultLocalOptions, selectedEnd));
+    setTargetOptions(mergeOptions(defaultLocalOptions, ...selectedTargets));
+  }, [defaultLocalOptions, selectedEnd, selectedStart, selectedTargets]);
 
   useEffect(() => {
     if (queryTransportations.length) {
@@ -485,26 +616,26 @@ const PathPlanningPage: React.FC = () => {
       const stopSelections = dayRoutePayloadFromQuery.map((stop, index) => toOption(stop, index));
 
       setMultiPointMode(queryMode === 'multi' || stopSelections.length > 1);
-      setReturnToStart(false);
       setSelectedEnd(null);
       setEndInput('');
       setSelectedTargets(stopSelections);
+      setSelectedTargetOption(null);
       setTargetInput('');
       setTargetOptions((current) => mergeOptions(current, ...stopSelections));
 
       if (isCityItineraryNavigation) {
         const currentLocation = await getCurrentLocationOption();
         if (currentLocation) {
-          setSelectedStart(currentLocation);
-          setStartInput(currentLocation.placeName);
-          setStartOptions((current) => mergeOptions(current, currentLocation, ...stopSelections));
+          setSelectedStart(currentLocation.option);
+          setStartInput(currentLocation.option.placeName);
+          setStartOptions((current) => mergeOptions(current, currentLocation.option, ...stopSelections));
           return;
         }
       }
 
       const fallbackStart = stopSelections[0];
       setSelectedStart(fallbackStart);
-      setStartInput(fallbackStart.placeName);
+      setStartInput(displayPlaceName(fallbackStart));
       setStartOptions((current) => mergeOptions(current, fallbackStart, ...stopSelections));
     };
 
@@ -546,10 +677,10 @@ const PathPlanningPage: React.FC = () => {
       const nextMultiDraft = multiTargetDraftRef.current;
       setSelectedEnd(null);
       setEndInput('');
-      if (nextMultiDraft.options.length || nextMultiDraft.input || nextMultiDraft.returnToStart) {
+      if (nextMultiDraft.options.length || nextMultiDraft.input) {
         setSelectedTargets(nextMultiDraft.options);
+        setSelectedTargetOption(null);
         setTargetInput(nextMultiDraft.input);
-        setReturnToStart(nextMultiDraft.returnToStart);
       }
     } else {
       const nextEndDraft = singleEndDraftRef.current;
@@ -561,8 +692,8 @@ const PathPlanningPage: React.FC = () => {
         setEndOptions((current) => mergeOptions(current, nextEndDraft.option));
       }
       setSelectedTargets([]);
+      setSelectedTargetOption(null);
       setTargetInput('');
-      setReturnToStart(false);
     }
   }, [multiPointMode]);
 
@@ -571,7 +702,6 @@ const PathPlanningPage: React.FC = () => {
       multiTargetDraftRef.current = {
         input: targetInput,
         options: selectedTargets,
-        returnToStart,
       };
     } else {
       singleEndDraftRef.current = {
@@ -579,7 +709,7 @@ const PathPlanningPage: React.FC = () => {
         option: selectedEnd,
       };
     }
-  }, [endInput, multiPointMode, returnToStart, selectedEnd, selectedTargets, targetInput]);
+  }, [endInput, multiPointMode, selectedEnd, selectedTargets, targetInput]);
 
   useEffect(() => {
     const initialize = async () => {
@@ -603,7 +733,7 @@ const PathPlanningPage: React.FC = () => {
         null;
       if (initialStart) {
         setSelectedStart(initialStart);
-        setStartInput(initialStart.placeName);
+        setStartInput(displayPlaceName(initialStart));
         setStartOptions((current) => mergeOptions(current, initialStart));
       } else if (hasCoord(queryStartLat, queryStartLng)) {
         try {
@@ -620,7 +750,7 @@ const PathPlanningPage: React.FC = () => {
               longitude: queryStartLng,
             };
           setSelectedStart(finalOption);
-          setStartInput(finalOption.placeName);
+          setStartInput(displayPlaceName(finalOption));
           setStartOptions((current) => mergeOptions(current, finalOption));
         } catch {
           setStartInput(queryStartName || '当前位置');
@@ -633,7 +763,7 @@ const PathPlanningPage: React.FC = () => {
         const initialEnd = optionRegistry.get(endNodeIdFromQuery) || localOptions.find((item) => item.value === endNodeIdFromQuery) || null;
         if (initialEnd) {
           setSelectedEnd(initialEnd);
-          setEndInput(initialEnd.placeName);
+          setEndInput(displayPlaceName(initialEnd));
           setEndOptions((current) => mergeOptions(current, initialEnd));
           return;
         }
@@ -641,7 +771,7 @@ const PathPlanningPage: React.FC = () => {
 
       const initialEndName = queryEndName || queryKeyword;
       if (!initialEndName && !hasCoord(queryEndLat, queryEndLng)) return;
-      setEndInput(initialEndName || '查询目的地');
+        setEndInput(initialEndName || '查询目的地');
 
       if (hasCoord(queryEndLat, queryEndLng)) {
         try {
@@ -650,15 +780,15 @@ const PathPlanningPage: React.FC = () => {
           const finalOption: SearchOption =
             matched || {
               value: nearest.data.nodeId,
-              label: initialEndName || '查询目的地',
-              placeName: initialEndName || '查询目的地',
+            label: initialEndName || '查询目的地',
+            placeName: initialEndName || '查询目的地',
               placeType: '设施',
               scenicAreaId,
               latitude: queryEndLat,
               longitude: queryEndLng,
             };
           setSelectedEnd(finalOption);
-          setEndInput(finalOption.placeName);
+          setEndInput(displayPlaceName(finalOption));
           setEndOptions((current) => mergeOptions(current, finalOption));
           return;
         } catch {
@@ -668,11 +798,11 @@ const PathPlanningPage: React.FC = () => {
 
       if (initialEndName) {
         try {
-          const response = await pathPlanningService.searchNodesByName(initialEndName, 12, scenicAreaId || undefined);
+          const response = await pathPlanningService.searchNodesByName(initialEndName, SEARCH_RESULT_LIMIT, scenicAreaId || undefined);
           const option = response.data.map(searchToOption)[0];
           if (option) {
             setSelectedEnd(option);
-            setEndInput(option.placeName);
+            setEndInput(displayPlaceName(option));
             setEndOptions((current) => mergeOptions(current, option));
           }
         } catch {
@@ -707,7 +837,7 @@ const PathPlanningPage: React.FC = () => {
 
       if (queryStartName) {
         try {
-          const response = await pathPlanningService.searchNodesByName(queryStartName, 12, scenicAreaId || undefined);
+          const response = await pathPlanningService.searchNodesByName(queryStartName, SEARCH_RESULT_LIMIT, scenicAreaId || undefined);
           const namedOption = findBestNamedOption(response.data.map(searchToOption), queryStartName);
           if (namedOption) {
             const displayOption: SearchOption = {
@@ -729,7 +859,7 @@ const PathPlanningPage: React.FC = () => {
       const targetEndName = queryEndName || queryKeyword;
       if (targetEndName) {
         try {
-          const response = await pathPlanningService.searchNodesByName(targetEndName, 12, scenicAreaId || undefined);
+          const response = await pathPlanningService.searchNodesByName(targetEndName, SEARCH_RESULT_LIMIT, scenicAreaId || undefined);
           const namedOption = findBestNamedOption(response.data.map(searchToOption), targetEndName);
           if (namedOption) {
             const displayOption: SearchOption = {
@@ -767,27 +897,55 @@ const PathPlanningPage: React.FC = () => {
     setMultiPreview(null);
     setActiveLegId(null);
     setActiveTransportPlanId(null);
-  }, [startInput, endInput, multiPointMode, selectedTargets, strategy, transportModes, returnToStart]);
+  }, [startInput, endInput, multiPointMode, selectedTargets, strategy, transportModes]);
 
   const searchNodes = async (keyword: string, target: 'start' | 'end' | 'target') => {
+    const requestId = ++getSearchSeqRef(target).current;
+    const localFallback = buildLocalSearchOptions(keyword, target);
+    if (scenicAreaId && defaultLocalOptions.length) {
+      setOptionsByTarget(target, localFallback);
+      return;
+    }
     if (target === 'start') setSearchingStart(true);
     if (target === 'end') setSearchingEnd(true);
     if (target === 'target') setSearchingTarget(true);
     try {
-      const response = await pathPlanningService.searchNodesByName(keyword, 12, scenicAreaId || undefined);
-      const options = response.data.map(searchToOption);
-      const fallback = keyword.trim() ? [] : preferredLocalOptions.slice(0, 12);
-      if (target === 'start') setStartOptions(options.length ? options : fallback);
-      if (target === 'end') setEndOptions(options.length ? options : fallback);
-      if (target === 'target') setTargetOptions(options.length ? options : fallback);
+      const trimmedKeyword = keyword.trim().toLowerCase();
+      const response = await pathPlanningService.searchNodesByName(keyword, SEARCH_RESULT_LIMIT, scenicAreaId || undefined);
+      const options = sortSearchOptions(
+        response.data.map(searchToOption).filter(isUserSelectablePlace),
+        keyword,
+        scenicAreaName || routeContext?.scenicAreaName,
+      );
+      const localMatches = defaultLocalOptions.filter(
+        (item) =>
+          !trimmedKeyword ||
+          item.placeName.toLowerCase().includes(trimmedKeyword) ||
+          item.label.toLowerCase().includes(trimmedKeyword) ||
+          displayPlaceName(item).toLowerCase().includes(trimmedKeyword),
+      );
+      const fallback = keyword.trim()
+        ? sortSearchOptions(localMatches, keyword, scenicAreaName || routeContext?.scenicAreaName)
+        : defaultLocalOptions;
+      if (requestId !== getSearchSeqRef(target).current) return;
+      setOptionsByTarget(target, options.length ? options : fallback);
     } catch {
-      const fallback = preferredLocalOptions
-        .filter((item) => !keyword.trim() || item.placeName.toLowerCase().includes(keyword.trim().toLowerCase()))
-        .slice(0, 12);
-      if (target === 'start') setStartOptions(fallback);
-      if (target === 'end') setEndOptions(fallback);
-      if (target === 'target') setTargetOptions(fallback);
+      const trimmedKeyword = keyword.trim().toLowerCase();
+      const fallback = sortSearchOptions(
+        defaultLocalOptions.filter(
+          (item) =>
+            !trimmedKeyword ||
+            item.placeName.toLowerCase().includes(trimmedKeyword) ||
+            item.label.toLowerCase().includes(trimmedKeyword) ||
+            displayPlaceName(item).toLowerCase().includes(trimmedKeyword),
+        ),
+        keyword,
+        scenicAreaName || routeContext?.scenicAreaName,
+      );
+      if (requestId !== getSearchSeqRef(target).current) return;
+      setOptionsByTarget(target, fallback);
     } finally {
+      if (requestId !== getSearchSeqRef(target).current) return;
       if (target === 'start') setSearchingStart(false);
       if (target === 'end') setSearchingEnd(false);
       if (target === 'target') setSearchingTarget(false);
@@ -805,7 +963,7 @@ const PathPlanningPage: React.FC = () => {
       value: item.value,
       label: (
         <Space direction="vertical" size={0}>
-          <Text strong>{item.placeName}</Text>
+          <Text strong>{displayPlaceName(item)}</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {placeTypeLabelMap[item.placeType] || item.placeType}
           </Text>
@@ -822,10 +980,16 @@ const PathPlanningPage: React.FC = () => {
       return scenicSelfOption;
     }
 
-    const localMatch = currentOptions.find((item) => item.placeName === trimmed || item.label === trimmed || item.value === trimmed);
+    const localMatch = currentOptions.find(
+      (item) =>
+        item.placeName === trimmed ||
+        item.label === trimmed ||
+        displayPlaceName(item) === trimmed ||
+        item.value === trimmed,
+    );
     if (localMatch) return localMatch;
 
-    const response = await pathPlanningService.searchNodesByName(trimmed, 12, scenicAreaId || undefined);
+    const response = await pathPlanningService.searchNodesByName(trimmed, SEARCH_RESULT_LIMIT, scenicAreaId || undefined);
     const candidates = response.data.map(searchToOption);
     return candidates.find((item) => item.placeName === trimmed) || candidates.find((item) => item.placeName.includes(trimmed)) || candidates[0] || null;
   };
@@ -875,12 +1039,12 @@ const PathPlanningPage: React.FC = () => {
   const buildCurrentLocationOption = async (
     latitude: number,
     longitude: number,
-  ): Promise<SearchOption | null> => {
+  ): Promise<CurrentLocationResolution | null> => {
     try {
       const response = await pathPlanningService.findNearestNode(latitude, longitude, scenicAreaId || undefined);
       const matched =
         optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
-      return matched
+      const option = matched
         ? {
             ...matched,
             label: '当前位置',
@@ -898,13 +1062,25 @@ const PathPlanningPage: React.FC = () => {
             latitude,
             longitude,
           };
+
+      const distanceToMatchedNode =
+        matched && hasCoord(matched.latitude, matched.longitude)
+          ? haversineDistance(latitude, longitude, Number(matched.latitude), Number(matched.longitude))
+          : 0;
+
+      const warning =
+        scenicAreaId && distanceToMatchedNode > CURRENT_LOCATION_DISTANCE_WARNING_METERS
+          ? `检测到你当前位置距离${scenicAreaName || routeContext?.scenicAreaName || '当前校园/景区'}内部路网较远，已为你匹配到最近可导航点。`
+          : null;
+
+      return { option, warning };
     } catch (error) {
       message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
       return null;
     }
   };
 
-  const getCurrentLocationOption = async (): Promise<SearchOption | null> => {
+  const getCurrentLocationOption = async (): Promise<CurrentLocationResolution | null> => {
     const nextLocation = currentLocation || (await requestLocation());
     if (!nextLocation) {
       message.warning({
@@ -919,14 +1095,17 @@ const PathPlanningPage: React.FC = () => {
 
   const applyCurrentLocationAsStart = (option: SearchOption) => {
     setSelectedStart(option);
-    setStartInput(option.placeName);
+    setStartInput(displayPlaceName(option));
     setStartOptions((current) => mergeOptions(current, option));
   };
 
   const handleUseCurrentLocation = async () => {
-    const option = await getCurrentLocationOption();
-    if (!option) return;
-    applyCurrentLocationAsStart(option);
+    const resolved = await getCurrentLocationOption();
+    if (!resolved) return;
+    applyCurrentLocationAsStart(resolved.option);
+    if (resolved.warning) {
+      message.warning(resolved.warning);
+    }
     message.success('已将当前位置设置为起点。');
   };
 
@@ -955,12 +1134,12 @@ const PathPlanningPage: React.FC = () => {
 
     let cancelled = false;
     const syncTrackedLocation = async () => {
-      const option = await buildCurrentLocationOption(currentLocation.latitude, currentLocation.longitude);
-      if (!option || cancelled) {
+      const resolved = await buildCurrentLocationOption(currentLocation.latitude, currentLocation.longitude);
+      if (!resolved || cancelled) {
         return;
       }
 
-      applyCurrentLocationAsStart(option);
+      applyCurrentLocationAsStart(resolved.option);
     };
 
     void syncTrackedLocation();
@@ -979,7 +1158,23 @@ const PathPlanningPage: React.FC = () => {
   ]);
 
   const handleAddTarget = async () => {
-    const resolved = await resolveExactSelection(targetInput, null, targetOptions);
+    const trimmedTargetInput = targetInput.trim();
+    const immediateSelection =
+      selectedTargetOption &&
+      (!trimmedTargetInput ||
+        displayPlaceName(selectedTargetOption) === trimmedTargetInput ||
+        selectedTargetOption.placeName === trimmedTargetInput ||
+        selectedTargetOption.value === trimmedTargetInput)
+        ? selectedTargetOption
+        : targetOptions.find(
+            (item) =>
+              item.placeName === trimmedTargetInput ||
+              item.label === trimmedTargetInput ||
+              displayPlaceName(item) === trimmedTargetInput ||
+              item.value === trimmedTargetInput,
+          ) || null;
+
+    const resolved = immediateSelection || (await resolveExactSelection(targetInput, null, targetOptions));
     if (!resolved) {
       message.warning('请先选择一个有效的途经点。');
       return;
@@ -989,17 +1184,19 @@ const PathPlanningPage: React.FC = () => {
       return;
     }
     setSelectedTargets((current) => [...current, resolved]);
+    setSelectedTargetOption(null);
     setTargetInput('');
+    setTargetOptions((current) => mergeOptions(current, resolved));
+    setDropdownOpenByTarget('target', false);
   };
 
   const buildMultiPreview = async (
     optimized: MultiPointPath,
     transportations: TransportType[],
-    shouldReturnToStart: boolean,
     startNodeId: string,
   ): Promise<MultiPreview> => {
     const order = [...optimized.order];
-    if (shouldReturnToStart && order[order.length - 1] !== startNodeId) {
+    if (order[order.length - 1] !== startNodeId) {
       order.push(startNodeId);
     }
 
@@ -1065,7 +1262,7 @@ const PathPlanningPage: React.FC = () => {
         return;
       }
       setSelectedStart(resolvedStart.option);
-      setStartInput(resolvedStart.option.placeName);
+      setStartInput(displayPlaceName(resolvedStart.option));
       setStartOptions((current) => mergeOptions(current, resolvedStart.option));
 
       if (multiPointMode) {
@@ -1096,7 +1293,7 @@ const PathPlanningPage: React.FC = () => {
                 strategy,
                 modes,
               );
-              return buildMultiPreview(optimized.data, modes, returnToStart, resolvedStart.nodeId);
+              return buildMultiPreview(optimized.data, modes, resolvedStart.nodeId);
             })();
         setTransportationPath(null);
         setMultiPreview(preview);
@@ -1115,7 +1312,7 @@ const PathPlanningPage: React.FC = () => {
           return;
         }
         setSelectedEnd(resolvedEnd.option);
-        setEndInput(resolvedEnd.option.placeName);
+        setEndInput(displayPlaceName(resolvedEnd.option));
         setEndOptions((current) => mergeOptions(current, resolvedEnd.option));
         const response = await pathPlanningService.planAdvancedRoute(resolvedStart.nodeId, resolvedEnd.nodeId, strategy, modes);
         setMultiPreview(null);
@@ -1233,6 +1430,7 @@ const PathPlanningPage: React.FC = () => {
             const isActive = activeTransportPlanId
               ? transportPlanId === activeTransportPlanId
               : !activeLegId || activeLegId === `leg-${pathIndex}`;
+            const highlightColor = segment.isConnector ? '#dc2626' : '#ef4444';
 
             return ({
             transportPlanId,
@@ -1243,11 +1441,17 @@ const PathPlanningPage: React.FC = () => {
                   [segment.fromLocation.latitude, segment.fromLocation.longitude] as [number, number],
                   [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
                 ],
-            color: segment.isConnector
-              ? '#f59e0b'
-              : useTransportColors && segment.transportation
-                ? transportColorMap[segment.transportation]
-                : congestionMeta(segment.congestionFactor).color,
+            color: activeTransportPlanId
+              ? isActive
+                ? highlightColor
+                : segment.isConnector
+                  ? '#f8b4b4'
+                  : '#cbd5e1'
+              : segment.isConnector
+                ? '#f59e0b'
+                : useTransportColors && segment.transportation
+                  ? transportColorMap[segment.transportation]
+                  : congestionMeta(segment.congestionFactor).color,
             isActive,
             title: `${segment.isConnector ? '步行接驳' : transportLabelMap[(segment.transportation || 'walk') as TransportType]} · ${
               segment.roadName || roadTypeLabelMap[segment.roadType] || '道路'
@@ -1290,9 +1494,35 @@ const PathPlanningPage: React.FC = () => {
     return items;
   }, [routePaths]);
 
+  const internalPlaceMarkers = useMemo(
+    () =>
+      roadNetwork.nodes
+        .filter(
+          (node) =>
+            (node.type === 'attraction' || node.type === 'facility') &&
+            hasCoord(node.location.latitude, node.location.longitude),
+        )
+        .map((node) => ({
+          id: `internal-${node.id}`,
+          position: [node.location.latitude, node.location.longitude] as [number, number],
+          title: pretty(node.name),
+          type: node.type,
+        })),
+    [roadNetwork.nodes],
+  );
+
   const mapMarkers = useMemo(() => {
+    const baseInternalMarkers = routeLegs.length
+      ? internalPlaceMarkers.map((marker) => ({
+          ...marker,
+          opacity: activeTransportPlanId ? 0.18 : 0.62,
+          size: activeTransportPlanId ? 22 : 26,
+          dimmed: true,
+        }))
+      : internalPlaceMarkers;
+
     if (!routeLegs.length) {
-      const previewMarkers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [];
+      const previewMarkers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [...baseInternalMarkers];
 
       if (hasCoord(selectedStart?.latitude, selectedStart?.longitude)) {
         previewMarkers.push({
@@ -1300,7 +1530,7 @@ const PathPlanningPage: React.FC = () => {
           position: [Number(selectedStart?.latitude), Number(selectedStart?.longitude)],
           title: `当前起点：${selectedStart?.placeName || selectedStart?.label || '起点'}`,
           type: 'start',
-          label: '起',
+          label: 'S',
         });
       }
 
@@ -1310,7 +1540,7 @@ const PathPlanningPage: React.FC = () => {
           position: [Number(selectedEnd?.latitude), Number(selectedEnd?.longitude)],
           title: `当前终点：${selectedEnd?.placeName || selectedEnd?.label || '终点'}`,
           type: 'end',
-          label: '终',
+          label: 'E',
         });
       }
 
@@ -1323,7 +1553,7 @@ const PathPlanningPage: React.FC = () => {
           previewMarkers.push({
             id: `draft-target-${item.value}`,
             position: [Number(item.latitude), Number(item.longitude)],
-            title: `途经点 ${index + 1}：${item.placeName}`,
+            title: `途经点 ${index + 1}：${displayPlaceName(item)}`,
             type: 'waypoint',
             label: String(index + 1),
           });
@@ -1333,14 +1563,14 @@ const PathPlanningPage: React.FC = () => {
       return previewMarkers;
     }
 
-    const markers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [];
+    const markers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string; opacity?: number; size?: number; dimmed?: boolean }> = [...baseInternalMarkers];
     const firstLeg = routePaths[0];
     const firstStartPoint =
       firstLeg?.segments?.[0]?.fromLocation
         ? [firstLeg.segments[0].fromLocation.latitude, firstLeg.segments[0].fromLocation.longitude] as [number, number]
         : routeLegs[0].points[0];
     if (firstStartPoint) {
-      markers.push({ id: 'start', position: firstStartPoint, title: `导航起点：${routeLegs[0].fromName}`, type: 'start', label: '起' });
+      markers.push({ id: 'start', position: firstStartPoint, title: `导航起点：${routeLegs[0].fromName}`, type: 'start', label: 'S' });
     }
     routeLegs.forEach((leg, index) => {
       const sourcePath = routePaths[index];
@@ -1361,16 +1591,25 @@ const PathPlanningPage: React.FC = () => {
     });
 
     return markers;
-  }, [multiPointMode, routeLegs, routePaths, selectedEnd, selectedStart, selectedTargets]);
+  }, [activeTransportPlanId, internalPlaceMarkers, multiPointMode, routeLegs, routePaths, selectedEnd, selectedStart, selectedTargets]);
 
   const mapCenter = useMemo<[number, number]>(() => {
     const center = routeContext?.center;
     if (center) return [center.latitude, center.longitude];
     if (routeLegs[0]?.points[0]) return routeLegs[0].points[0];
+    if (selectedStart?.placeName === '当前位置' && hasCoord(selectedStart.latitude, selectedStart.longitude)) {
+      return [Number(selectedStart.latitude), Number(selectedStart.longitude)];
+    }
     const firstNode = roadNetwork.nodes[0];
     if (firstNode) return [firstNode.location.latitude, firstNode.location.longitude];
     return [39.9042, 116.4074];
-  }, [roadNetwork.nodes, routeContext?.center, routeLegs]);
+  }, [roadNetwork.nodes, routeContext?.center, routeLegs, selectedStart]);
+
+  const shouldFocusCurrentLocationPreview =
+    !routeLegs.length &&
+    selectedStart?.placeName === '当前位置' &&
+    hasCoord(selectedStart.latitude, selectedStart.longitude);
+  const shouldFocusTransportPlan = Boolean(activeTransportPlanId);
 
   const activeLeg = routeLegs.find((item) => item.id === activeLegId) || routeLegs[0] || null;
   const activePathIndex = activeLeg ? routeLegs.findIndex((item) => item.id === activeLeg.id) : 0;
@@ -1383,6 +1622,10 @@ const PathPlanningPage: React.FC = () => {
     [routeLegs],
   );
   const mapFocusPoints = useMemo(() => {
+    if (shouldFocusCurrentLocationPreview && selectedStart?.latitude && selectedStart?.longitude) {
+      return [[Number(selectedStart.latitude), Number(selectedStart.longitude)] as [number, number]];
+    }
+
     if (!activeTransportPlan || activePathIndex < 0) {
       if (activeLeg?.points?.length) {
         return activeLeg.points;
@@ -1405,14 +1648,14 @@ const PathPlanningPage: React.FC = () => {
             [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
           ],
     );
-  }, [activeLeg, activePathIndex, activeTransportPlan, mapMarkers, routePaths]);
+  }, [activeLeg, activePathIndex, activeTransportPlan, mapMarkers, routePaths, selectedStart, shouldFocusCurrentLocationPreview]);
   const noResultContent = <Text type="secondary">当前范围内暂无匹配地点</Text>;
 
   return (
     <div style={{ padding: '28px 24px 40px' }}>
       <Space direction="vertical" size={24} style={{ width: '100%' }}>
         <div>
-          <Title level={2} style={{ marginBottom: 8 }}>户外路径规划</Title>
+          <Title level={2} style={{ marginBottom: 8 }}>{`${scenicAreaName || routeContext?.scenicAreaName || '景区或校园'}内部路线规划`}</Title>
           <Paragraph type="secondary" style={{ marginBottom: 0 }}>
             回到更稳定的按名称选点体验，同时保留多目标点、最短时间 / 最短距离和混合交通工具功能。
           </Paragraph>
@@ -1445,26 +1688,38 @@ const PathPlanningPage: React.FC = () => {
                 style={{ width: '100%', marginTop: 8 }}
                 value={startInput}
                 options={searchSelectOptions(startOptions)}
+                open={startDropdownOpen && startOptions.length > 0}
                 onChange={(value) => {
                   const nextValue = String(value);
                   setStartInput(nextValue);
-                  if (selectedStart && nextValue !== selectedStart.placeName) {
+                  if (selectedStart && nextValue !== displayPlaceName(selectedStart)) {
                     setSelectedStart(null);
                   }
+                  applyLocalSearchOptions(nextValue, 'start');
+                  setDropdownOpenByTarget('start', true);
+                  debounceSearch(nextValue, 'start');
                 }}
                 onSearch={(value) => {
                   setStartInput(value);
+                  applyLocalSearchOptions(value, 'start');
+                  setDropdownOpenByTarget('start', true);
                   debounceSearch(value, 'start');
                 }}
                 onSelect={(value) => {
                   const option = optionRegistry.get(String(value));
                   if (!option) return;
                   setSelectedStart(option);
-                  setStartInput(option.placeName);
+                  setStartInput(displayPlaceName(option));
+                  setDropdownOpenByTarget('start', false);
+                }}
+                onFocus={() => {
+                  applyLocalSearchOptions(startInput, 'start');
+                  setDropdownOpenByTarget('start', true);
                 }}
                 onBlur={() => {
-                  if (selectedStart && startInput === selectedStart.placeName) return;
+                  if (selectedStart && startInput === displayPlaceName(selectedStart)) return;
                   setSelectedStart(null);
+                  window.setTimeout(() => setDropdownOpenByTarget('start', false), 120);
                 }}
                 placeholder="按名称搜索起点"
                 filterOption={false}
@@ -1491,8 +1746,7 @@ const PathPlanningPage: React.FC = () => {
                     setSelectedEnd(previousStartOption);
                   }}
                 >
-                  交换起终点
-                </Button>
+                  交换起终点                </Button>
               </Space>
               <Space wrap style={{ marginTop: 8 }}>
                 {isWatchingCurrentLocation ? <Tag color="green">实时定位中</Tag> : null}
@@ -1510,26 +1764,38 @@ const PathPlanningPage: React.FC = () => {
                     style={{ width: '100%', marginTop: 8 }}
                     value={endInput}
                     options={searchSelectOptions(endOptions)}
+                    open={endDropdownOpen && endOptions.length > 0}
                     onChange={(value) => {
                       const nextValue = String(value);
                       setEndInput(nextValue);
-                      if (selectedEnd && nextValue !== selectedEnd.placeName) {
+                      if (selectedEnd && nextValue !== displayPlaceName(selectedEnd)) {
                         setSelectedEnd(null);
                       }
+                      applyLocalSearchOptions(nextValue, 'end');
+                      setDropdownOpenByTarget('end', true);
+                      debounceSearch(nextValue, 'end');
                     }}
                     onSearch={(value) => {
                       setEndInput(value);
+                      applyLocalSearchOptions(value, 'end');
+                      setDropdownOpenByTarget('end', true);
                       debounceSearch(value, 'end');
                     }}
                     onSelect={(value) => {
                       const option = optionRegistry.get(String(value));
                       if (!option) return;
                       setSelectedEnd(option);
-                      setEndInput(option.placeName);
+                      setEndInput(displayPlaceName(option));
+                      setDropdownOpenByTarget('end', false);
+                    }}
+                    onFocus={() => {
+                      applyLocalSearchOptions(endInput, 'end');
+                      setDropdownOpenByTarget('end', true);
                     }}
                     onBlur={() => {
-                      if (selectedEnd && endInput === selectedEnd.placeName) return;
+                      if (selectedEnd && endInput === displayPlaceName(selectedEnd)) return;
                       setSelectedEnd(null);
+                      window.setTimeout(() => setDropdownOpenByTarget('end', false), 120);
                     }}
                     placeholder="按名称搜索终点"
                     filterOption={false}
@@ -1544,15 +1810,41 @@ const PathPlanningPage: React.FC = () => {
                     style={{ width: '100%', marginTop: 8 }}
                     value={targetInput}
                     options={searchSelectOptions(targetOptions)}
-                    onChange={(value) => setTargetInput(String(value))}
+                    open={targetDropdownOpen && targetOptions.length > 0}
+                    onChange={(value) => {
+                      const nextValue = String(value);
+                      setTargetInput(nextValue);
+                      if (selectedTargetOption && displayPlaceName(selectedTargetOption) !== nextValue) {
+                        setSelectedTargetOption(null);
+                      }
+                      applyLocalSearchOptions(nextValue, 'target');
+                      setDropdownOpenByTarget('target', true);
+                      debounceSearch(nextValue, 'target');
+                    }}
                     onSearch={(value) => {
                       setTargetInput(value);
+                      if (selectedTargetOption && displayPlaceName(selectedTargetOption) !== value) {
+                        setSelectedTargetOption(null);
+                      }
+                      applyLocalSearchOptions(value, 'target');
+                      setDropdownOpenByTarget('target', true);
                       debounceSearch(value, 'target');
                     }}
                     onSelect={(value) => {
                       const option = optionRegistry.get(String(value));
                       if (!option) return;
-                      setTargetInput(option.placeName);
+                      setSelectedTargetOption(option);
+                      setTargetInput(displayPlaceName(option));
+                      setDropdownOpenByTarget('target', false);
+                    }}
+                    onFocus={() => {
+                      applyLocalSearchOptions(targetInput, 'target');
+                      setDropdownOpenByTarget('target', true);
+                    }}
+                    onBlur={() => {
+                      if (selectedTargetOption && targetInput === displayPlaceName(selectedTargetOption)) return;
+                      setSelectedTargetOption(null);
+                      window.setTimeout(() => setDropdownOpenByTarget('target', false), 120);
                     }}
                     placeholder="添加途经点"
                     filterOption={false}
@@ -1563,26 +1855,28 @@ const PathPlanningPage: React.FC = () => {
                     <Button icon={<PlusOutlined />} onClick={() => void handleAddTarget()}>
                       添加途经点
                     </Button>
-                    <Space align="center">
-                      <Switch checked={returnToStart} onChange={setReturnToStart} />
-                      <Text>参观后返回起点</Text>
-                    </Space>
                   </Space>
-                  <Space wrap style={{ marginTop: 12 }}>
-                    {selectedTargets.map((item, index) => (
-                      <Tag
-                        key={item.value}
-                        closable
-                        color="blue"
-                        onClose={(event) => {
-                          event.preventDefault();
-                          setSelectedTargets((current) => current.filter((target) => target.value !== item.value));
-                        }}
-                      >
-                        第 {index + 1} 站：{item.placeName}
-                      </Tag>
-                    ))}
-                  </Space>
+                  <div style={{ marginTop: 12, minHeight: 32 }}>
+                    {selectedTargets.length ? (
+                      <Space wrap>
+                        {selectedTargets.map((item) => (
+                          <Tag
+                            key={item.value}
+                            closable
+                            color="blue"
+                            onClose={(event) => {
+                              event.preventDefault();
+                              setSelectedTargets((current) => current.filter((target) => target.value !== item.value));
+                            }}
+                          >
+                            {displayPlaceName(item)}
+                          </Tag>
+                        ))}
+                      </Space>
+                    ) : (
+                      <Text type="secondary">已选途经点会显示在这里。</Text>
+                    )}
+                  </div>
                 </>
               )}
             </Col>
@@ -1632,7 +1926,7 @@ const PathPlanningPage: React.FC = () => {
             </Col>
           </Row>
           <Text type="secondary" style={{ display: 'block', marginTop: 16 }}>
-            当前只展示当前景区或校园范围内的候选地点。多目标点模式下，先添加途经点，再生成最优路线；开启“返回起点”后会自动补齐闭环路径。
+            当前只展示当前景区或校园范围内的候选地点。多目标点模式下，先添加途经点，再生成最优路线；系统会在参观完成后自动返回起点。
           </Text>
           <Space style={{ marginTop: 24 }} wrap>
             <Button type="primary" onClick={() => void handleSubmit()} loading={loadingRoute} size="large">
@@ -1691,7 +1985,7 @@ const PathPlanningPage: React.FC = () => {
                         <Tag color="magenta">混合交通</Tag>
                       ) : null}
                       {multiPointMode ? <Tag color="cyan">多目标点</Tag> : <Tag color="default">单终点</Tag>}
-                      {multiPointMode && returnToStart ? <Tag color="purple">返回起点</Tag> : null}
+                      {multiPointMode ? <Tag color="purple">返回起点</Tag> : null}
                     </Space>
                     <Card variant="borderless" style={{ borderRadius: 20, background: '#f8fafc' }}>
                       <Space direction="vertical" size={14} style={{ width: '100%' }}>
@@ -1794,15 +2088,21 @@ const PathPlanningPage: React.FC = () => {
                     <Button type={baseMapMode === 'street' ? 'primary' : 'default'} disabled={!hasStreetRoute} onClick={() => setBaseMapMode('street')}>真实街道图</Button>
                   </Space>
                   <Space>
-                    <Text>显示路网参考线</Text>
-                    <Switch checked={showRoadNetwork} onChange={setShowRoadNetwork} disabled={hasStreetRoute} />
+                    <Text>{baseMapMode === 'scenic' ? '模板路网底图' : '显示路网参考线'}</Text>
+                    <Switch
+                      checked={baseMapMode === 'scenic' ? true : showRoadNetwork}
+                      onChange={setShowRoadNetwork}
+                      disabled={hasStreetRoute || baseMapMode === 'scenic'}
+                    />
                   </Space>
                 </Space>
                 <Card variant="borderless" style={{ borderRadius: 24, background: '#f8fafc' }} bodyStyle={{ padding: 12 }}>
-                  <MapComponent
-                    center={mapCenter}
-                    zoom={16}
-                    markers={mapMarkers}
+                    <MapComponent
+                      center={mapCenter}
+                      zoom={16}
+                      focusZoom={shouldFocusTransportPlan ? 18 : 16}
+                      preferFocusPoints={shouldFocusCurrentLocationPreview || shouldFocusTransportPlan}
+                      markers={mapMarkers}
                     routeLegs={mapRouteLegs}
                     congestionSegments={congestionSegments}
                     activeRouteLegId={activeLegId || routeLegs[0]?.id || null}
